@@ -1,0 +1,371 @@
+name: Build patched OpenList
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "OpenList tag; leave empty for the latest stable release"
+        required: false
+        type: string
+      force_build:
+        description: "Build even when the exact image tag already exists"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build.yml"
+      - "overlay/**"
+      - "scripts/**"
+      - "tests/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build.yml"
+      - "overlay/**"
+      - "scripts/**"
+      - "tests/**"
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('openlist-pikpak-pr-{0}', github.event.pull_request.number) || 'openlist-pikpak-publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: OpenListTeam/OpenList
+  RELEASE_PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  resolve:
+    name: Resolve upstream release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      exact_tag: ${{ steps.metadata.outputs.exact_tag }}
+      image: ${{ steps.metadata.outputs.image }}
+      publish_latest: ${{ steps.metadata.outputs.publish_latest }}
+      should_build: ${{ steps.existing.outputs.should_build }}
+      upstream_sha: ${{ steps.metadata.outputs.upstream_sha }}
+      upstream_tag: ${{ steps.metadata.outputs.upstream_tag }}
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve version and content tag
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          upstream_tag="${INPUT_TAG:-}"
+          publish_latest=false
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="$(
+              curl -fsSL --retry 3 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$UPSTREAM_REPOSITORY/releases/latest" |
+                jq -er '.tag_name'
+            )"
+            publish_latest=true
+          fi
+
+          if [[ ! "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid stable OpenList tag: $upstream_tag" >&2
+            exit 1
+          fi
+
+          refs="$(
+            git ls-remote --exit-code \
+              "https://github.com/$UPSTREAM_REPOSITORY.git" \
+              "refs/tags/$upstream_tag" "refs/tags/$upstream_tag^{}"
+          )"
+          upstream_sha="$(awk '$2 ~ /\^\{\}$/ { print $1 }' <<<"$refs")"
+          if [[ -z "$upstream_sha" ]]; then
+            upstream_sha="$(awk 'NR == 1 { print $1 }' <<<"$refs")"
+          fi
+          if [[ ! "$upstream_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Could not resolve commit for $upstream_tag" >&2
+            exit 1
+          fi
+
+          mapfile -d '' patch_files < <(
+            find overlay scripts/apply_patch.py -type f -print0 | sort -z
+          )
+          if (( ${#patch_files[@]} == 0 )); then
+            echo "No patch inputs found" >&2
+            exit 1
+          fi
+          patch_id="$(
+            sha256sum "${patch_files[@]}" |
+              sha256sum |
+              cut -c1-12
+          )"
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          exact_tag="${upstream_tag}-u${upstream_sha:0:12}-p${patch_id}"
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_sha=$upstream_sha"
+            echo "publish_latest=$publish_latest"
+            echo "image=$image"
+            echo "exact_tag=$exact_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Check whether image aliases are current
+        id: existing
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXACT_TAG: ${{ steps.metadata.outputs.exact_tag }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          PUBLISH_LATEST: ${{ steps.metadata.outputs.publish_latest }}
+          UPSTREAM_TAG: ${{ steps.metadata.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "push" || "$FORCE_BUILD" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          image_digest() {
+            docker buildx imagetools inspect "$1" 2>/dev/null |
+              awk '$1 == "Digest:" { print $2; exit }' || true
+          }
+
+          exact_digest="$(image_digest "$IMAGE:$EXACT_TAG")"
+          version_digest="$(image_digest "$IMAGE:$UPSTREAM_TAG")"
+          latest_digest=""
+          if [[ "$PUBLISH_LATEST" == "true" ]]; then
+            latest_digest="$(image_digest "$IMAGE:latest")"
+          fi
+
+          if [[ -n "$exact_digest" && "$version_digest" == "$exact_digest" ]] &&
+             [[ "$PUBLISH_LATEST" != "true" || "$latest_digest" == "$exact_digest" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Image and aliases are current: $IMAGE:$EXACT_TAG"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Image or alias is missing/stale; rebuilding to repair tags"
+          fi
+
+  validate:
+    name: Validate patch
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out OpenList
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify upstream commit
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actual_sha="$(git -C upstream rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Expected $EXPECTED_SHA, got $actual_sha" >&2
+            exit 1
+          fi
+
+      - name: Test patcher
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Apply guarded patch
+        run: |
+          python3 scripts/apply_patch.py upstream
+          git -C upstream diff --check
+          git -C upstream status --short
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: upstream/go.mod
+          cache: false
+
+      - name: Verify formatting
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t unformatted < <(
+            gofmt -l \
+              drivers/pikpak/driver.go \
+              drivers/pikpak/transfer_config.go \
+              drivers/pikpak/transfer_config_test.go \
+              internal/model/args.go \
+              internal/op/link_cache_type.go \
+              internal/op/link_cache_type_test.go \
+              internal/fs/copy_move.go \
+              internal/offline_download/tool/transfer.go
+          )
+          if (( ${#unformatted[@]} > 0 )); then
+            printf 'Unformatted Go file: %s\n' "${unformatted[@]}" >&2
+            exit 1
+          fi
+
+      - name: Run affected package tests
+        working-directory: upstream
+        run: |
+          go test ./drivers/pikpak
+          go test ./internal/op
+          go test ./internal/fs
+          go test ./internal/offline_download/tool
+
+  publish:
+    name: Build and publish image
+    needs:
+      - resolve
+      - validate
+    if: github.event_name != 'pull_request' && needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out OpenList
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify and patch upstream source
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actual_sha="$(git -C upstream rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Expected $EXPECTED_SHA, got $actual_sha" >&2
+            exit 1
+          fi
+          python3 scripts/apply_patch.py upstream
+          git -C upstream diff --check
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Prepare image tags
+        id: tags
+        env:
+          EXACT_TAG: ${{ needs.resolve.outputs.exact_tag }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          PUBLISH_LATEST: ${{ needs.resolve.outputs.publish_latest }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          {
+            echo "value<<EOF"
+            echo "$IMAGE:$EXACT_TAG"
+            echo "$IMAGE:$UPSTREAM_TAG"
+            if [[ "$PUBLISH_LATEST" == "true" ]]; then
+              echo "$IMAGE:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        id: docker_build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          platforms: ${{ env.RELEASE_PLATFORMS }}
+          push: true
+          pull: true
+          tags: ${{ steps.tags.outputs.value }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.exact_tag }}
+            org.opencontainers.image.title=OpenList PikPak multithread transfer build
+            io.github.openlist.upstream-revision=${{ needs.resolve.outputs.upstream_sha }}
+            io.github.openlist.upstream-tag=${{ needs.resolve.outputs.upstream_tag }}
+          cache-from: type=gha,scope=openlist-pikpak
+          cache-to: type=gha,mode=max,scope=openlist-pikpak
+          provenance: mode=max
+          sbom: true
+
+      - name: Write build summary
+        if: always()
+        env:
+          EXACT_TAG: ${{ needs.resolve.outputs.exact_tag }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.docker_build.outputs.digest }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          {
+            echo "## OpenList PikPak build"
+            echo
+            echo "- Upstream: \`$UPSTREAM_TAG\`"
+            echo "- Exact image: \`$IMAGE:$EXACT_TAG\`"
+            if [[ -n "$IMAGE_DIGEST" ]]; then
+              echo "- Manifest digest: \`$IMAGE_DIGEST\`"
+            fi
+            echo "- Platforms: \`$RELEASE_PLATFORMS\`"
+          } >> "$GITHUB_STEP_SUMMARY"

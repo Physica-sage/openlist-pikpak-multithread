@@ -1,0 +1,20 @@
+services:
+  openlist:
+    image: ghcr.io/your-github-name/openlist-pikpak-multithread:latest
+    container_name: openlist
+    user: "0:0"
+    volumes:
+      - ./data:/opt/openlist/data
+      - ./temp/qBittorrent:/opt/openlist/data/temp/qBittorrent
+      - /mnt/alist:/mnt/alist
+      - /mnt/media:/mnt/media
+    ports:
+      - 172.17.0.1:11524:5244
+    environment:
+      UMASK: "022"
+      PIKPAK_TRANSFER_CONCURRENCY: "10"
+      PIKPAK_TRANSFER_PART_SIZE_MB: "32"
+      MAX_CONCURRENCY: "64"
+      MAX_BLOCK_LIMIT: "64"
+    restart: unless-stopped
+
