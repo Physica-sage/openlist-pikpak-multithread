@@ -2,12 +2,19 @@
 
 这是一个非官方的 OpenList Docker 构建仓库。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR。
 
-补丁只加速以 PikPak 为源的内部转存：
+当前补丁包含两部分：
+
+1. **PikPak 多线程转存**：只加速以 PikPak 为源的内部转存。
+2. **STRM 批量写入钩子修复**：同存储批量移动、复制或合并多个目录时，聚合每个成功项目的精确更新路径，避免只扫描最后一个目录而导致本地 `.strm` 落盘缺失。
+
+PikPak 多线程参数只作用于以下路径：
 
 - OpenList 网盘间复制或移动中的下载阶段。
 - 离线下载完成后的目标存储转存阶段。
 - 普通代理下载、直链访问和媒体播放不启用这组参数。
 - 只作用于 `PikPak` 驱动，不作用于 `PikPak Share`。
+
+STRM 修复位于 OpenList 通用文件操作和写入后钩子层，不依赖 PikPak 驱动；关闭全局 `Handle hook after writing` 时不会增加扫描。跨存储异步任务仍由上游的 `TransferCoordinator` 在任务完成后触发钩子。
 
 ## 默认参数
 

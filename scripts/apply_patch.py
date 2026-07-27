@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the PikPak transfer multirange overlay to an OpenList source tree."""
+"""Apply the PikPak transfer and STRM batch-hook patches to OpenList."""
 
 from __future__ import annotations
 
@@ -63,6 +63,214 @@ REPLACEMENTS = (
         """\ttypeKey := linkCacheTypeKey(args)""",
     ),
     Replacement(
+        "internal/op/fs.go",
+        """\tsrcKey := Key(storage, srcDirPath)
+\tdstKey := Key(storage, dstDirPath)
+\tif !srcRawObj.IsDir() {
+\t\tCache.linkCache.DeleteKey(stdpath.Join(srcKey, srcRawObj.GetName()))
+\t\tCache.linkCache.DeleteKey(stdpath.Join(dstKey, srcRawObj.GetName()))
+\t}
+\tif !storage.Config().NoCache {
+\t\tif cache, exist := Cache.dirCache.Get(srcKey); exist {
+\t\t\tif srcRawObj.IsDir() {
+\t\t\t\tCache.deleteDirectoryTree(stdpath.Join(srcKey, srcRawObj.GetName()))
+\t\t\t}
+\t\t\tcache.RemoveObject(srcRawObj.GetName())
+\t\t}
+\t\tif cache, exist := Cache.dirCache.Get(dstKey); exist {
+\t\t\tif newObj == nil {
+\t\t\t\tnewObj = &model.ObjWrapMask{Obj: srcRawObj, Mask: model.Temp}
+\t\t\t} else {
+\t\t\t\tnewObj = wrapObjName(storage, newObj)
+\t\t\t}
+\t\t\tcache.UpdateObject(srcRawObj.GetName(), newObj)
+\t\t}
+\t}
+
+\tif ctx.Value(conf.SkipHookKey) != nil || !needHandleObjsUpdateHook() {
+\t\treturn nil
+\t}
+\tif !srcObj.IsDir() {
+\t\tgo objsUpdateHook(context.WithoutCancel(ctx), storage, dstDirPath, false)
+\t} else {
+\t\tgo objsUpdateHook(context.WithoutCancel(ctx), storage, stdpath.Join(dstDirPath, srcObj.GetName()), true)
+\t}""",
+        """\tsrcKey := Key(storage, srcDirPath)
+\tdstKey := Key(storage, dstDirPath)
+\tif !srcRawObj.IsDir() {
+\t\tCache.linkCache.DeleteKey(stdpath.Join(srcKey, srcRawObj.GetName()))
+\t\tCache.linkCache.DeleteKey(stdpath.Join(dstKey, srcRawObj.GetName()))
+\t}
+\tif !storage.Config().NoCache {
+\t\tif cache, exist := Cache.dirCache.Get(srcKey); exist {
+\t\t\tif srcRawObj.IsDir() {
+\t\t\t\tCache.deleteDirectoryTree(stdpath.Join(srcKey, srcRawObj.GetName()))
+\t\t\t}
+\t\t\tcache.RemoveObject(srcRawObj.GetName())
+\t\t}
+\t\tif cache, exist := Cache.dirCache.Get(dstKey); exist {
+\t\t\tif newObj == nil {
+\t\t\t\tnewObj = &model.ObjWrapMask{Obj: srcRawObj, Mask: model.Temp}
+\t\t\t} else {
+\t\t\t\tnewObj = wrapObjName(storage, newObj)
+\t\t\t}
+\t\t\tcache.UpdateObject(srcRawObj.GetName(), newObj)
+\t\t}
+\t}
+
+\thookPath := dstDirPath
+\trecursiveHook := srcObj.IsDir()
+\tif recursiveHook {
+\t\thookPath = stdpath.Join(dstDirPath, srcObj.GetName())
+\t}
+\tif enqueueObjsUpdateHook(ctx, storage, hookPath, recursiveHook) {
+\t\treturn nil
+\t}
+\tif ctx.Value(conf.SkipHookKey) != nil || !needHandleObjsUpdateHook() {
+\t\treturn nil
+\t}
+\tgo objsUpdateHook(context.WithoutCancel(ctx), storage, hookPath, recursiveHook)""",
+    ),
+    Replacement(
+        "internal/op/fs.go",
+        """\tdstKey := Key(storage, dstDirPath)
+\tif !srcRawObj.IsDir() {
+\t\tCache.linkCache.DeleteKey(stdpath.Join(dstKey, srcRawObj.GetName()))
+\t}
+\tif !storage.Config().NoCache {
+\t\tif cache, exist := Cache.dirCache.Get(dstKey); exist {
+\t\t\tif newObj == nil {
+\t\t\t\tnewObj = &model.ObjWrapMask{Obj: srcRawObj, Mask: model.Temp}
+\t\t\t} else {
+\t\t\t\tnewObj = wrapObjName(storage, newObj)
+\t\t\t}
+\t\t\tcache.UpdateObject(srcRawObj.GetName(), newObj)
+\t\t}
+\t}
+
+\tif ctx.Value(conf.SkipHookKey) != nil || !needHandleObjsUpdateHook() {
+\t\treturn nil
+\t}
+\tif !srcObj.IsDir() {
+\t\tgo objsUpdateHook(context.WithoutCancel(ctx), storage, dstDirPath, false)
+\t} else {
+\t\tgo objsUpdateHook(context.WithoutCancel(ctx), storage, stdpath.Join(dstDirPath, srcObj.GetName()), true)
+\t}""",
+        """\tdstKey := Key(storage, dstDirPath)
+\tif !srcRawObj.IsDir() {
+\t\tCache.linkCache.DeleteKey(stdpath.Join(dstKey, srcRawObj.GetName()))
+\t}
+\tif !storage.Config().NoCache {
+\t\tif cache, exist := Cache.dirCache.Get(dstKey); exist {
+\t\t\tif newObj == nil {
+\t\t\t\tnewObj = &model.ObjWrapMask{Obj: srcRawObj, Mask: model.Temp}
+\t\t\t} else {
+\t\t\t\tnewObj = wrapObjName(storage, newObj)
+\t\t\t}
+\t\t\tcache.UpdateObject(srcRawObj.GetName(), newObj)
+\t\t}
+\t}
+
+\thookPath := dstDirPath
+\trecursiveHook := srcObj.IsDir()
+\tif recursiveHook {
+\t\thookPath = stdpath.Join(dstDirPath, srcObj.GetName())
+\t}
+\tif enqueueObjsUpdateHook(ctx, storage, hookPath, recursiveHook) {
+\t\treturn nil
+\t}
+\tif ctx.Value(conf.SkipHookKey) != nil || !needHandleObjsUpdateHook() {
+\t\treturn nil
+\t}
+\tgo objsUpdateHook(context.WithoutCancel(ctx), storage, hookPath, recursiveHook)""",
+    ),
+    Replacement(
+        "server/handles/fsmanage.go",
+        """\t// Create all tasks immediately without any synchronous validation
+\t// All validation will be done asynchronously in the background
+\tvar addedTasks []task.TaskExtensionInfo
+\tfor i, p := range req.Names {
+\t\tif p == "" {
+\t\t\tcontinue
+\t\t}
+\t\tt, err := fs.Move(c.Request.Context(), p, dstDir, len(req.Names) > i+1)
+\t\tif t != nil {
+\t\t\taddedTasks = append(addedTasks, t)
+\t\t}
+\t\tif err != nil {
+\t\t\tcommon.ErrorResp(c, err, 500)
+\t\t\treturn
+\t\t}
+\t}""",
+        """\t// Create all tasks immediately without any synchronous validation.
+\t// Direct operations collect exact hook targets; async transfer tasks keep
+\t// using TransferCoordinator and dispatch their hooks after completion.
+\tvar addedTasks []task.TaskExtensionInfo
+\tbatchCtx, hookBatch := op.WithObjsUpdateHookBatch(c.Request.Context())
+\tdefer hookBatch.Dispatch(c.Request.Context())
+\tfor _, p := range req.Names {
+\t\tif p == "" {
+\t\t\tcontinue
+\t\t}
+\t\tt, err := fs.Move(batchCtx, p, dstDir)
+\t\tif t != nil {
+\t\t\taddedTasks = append(addedTasks, t)
+\t\t}
+\t\tif err != nil {
+\t\t\tcommon.ErrorResp(c, err, 500)
+\t\t\treturn
+\t\t}
+\t}""",
+    ),
+    Replacement(
+        "server/handles/fsmanage.go",
+        """\t// Create all tasks immediately without any synchronous validation
+\t// All validation will be done asynchronously in the background
+\tvar addedTasks []task.TaskExtensionInfo
+\tfor i, p := range req.Names {
+\t\tif p == "" {
+\t\t\tcontinue
+\t\t}
+\t\tvar t task.TaskExtensionInfo
+\t\tif req.Merge {
+\t\t\tt, err = fs.Merge(c.Request.Context(), p, dstDir, len(req.Names) > i+1)
+\t\t} else {
+\t\t\tt, err = fs.Copy(c.Request.Context(), p, dstDir, len(req.Names) > i+1)
+\t\t}
+\t\tif t != nil {
+\t\t\taddedTasks = append(addedTasks, t)
+\t\t}
+\t\tif err != nil {
+\t\t\tcommon.ErrorResp(c, err, 500)
+\t\t\treturn
+\t\t}
+\t}""",
+        """\t// Create all tasks immediately without any synchronous validation.
+\t// Direct operations collect exact hook targets; async transfer tasks keep
+\t// using TransferCoordinator and dispatch their hooks after completion.
+\tvar addedTasks []task.TaskExtensionInfo
+\tbatchCtx, hookBatch := op.WithObjsUpdateHookBatch(c.Request.Context())
+\tdefer hookBatch.Dispatch(c.Request.Context())
+\tfor _, p := range req.Names {
+\t\tif p == "" {
+\t\t\tcontinue
+\t\t}
+\t\tvar t task.TaskExtensionInfo
+\t\tif req.Merge {
+\t\t\tt, err = fs.Merge(batchCtx, p, dstDir)
+\t\t} else {
+\t\t\tt, err = fs.Copy(batchCtx, p, dstDir)
+\t\t}
+\t\tif t != nil {
+\t\t\taddedTasks = append(addedTasks, t)
+\t\t}
+\t\tif err != nil {
+\t\t\tcommon.ErrorResp(c, err, 500)
+\t\t\treturn
+\t\t}
+\t}""",
+    ),
+    Replacement(
         "internal/fs/copy_move.go",
         """\tlink, srcObj, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{})""",
         """\tlink, srcObj, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{InternalTransfer: true})""",
@@ -76,13 +284,15 @@ REPLACEMENTS = (
 
 
 def prepare_replacements(source_root: Path) -> list[tuple[Path, str]]:
-    updates: list[tuple[Path, str]] = []
+    updates: dict[Path, str] = {}
     for replacement in REPLACEMENTS:
         path = source_root / replacement.path
         if not path.is_file():
             raise PatchError(f"required upstream file is missing: {replacement.path}")
 
-        content = path.read_text(encoding="utf-8")
+        content = updates.get(path)
+        if content is None:
+            content = path.read_text(encoding="utf-8")
         matches = content.count(replacement.before)
         if matches != 1:
             state = "already patched" if replacement.after in content else "upstream changed"
@@ -90,8 +300,8 @@ def prepare_replacements(source_root: Path) -> list[tuple[Path, str]]:
                 f"cannot patch {replacement.path}: expected one source anchor, "
                 f"found {matches} ({state})"
             )
-        updates.append((path, content.replace(replacement.before, replacement.after, 1)))
-    return updates
+        updates[path] = content.replace(replacement.before, replacement.after, 1)
+    return list(updates.items())
 
 
 def prepare_overlay(source_root: Path) -> list[tuple[Path, Path]]:
@@ -142,7 +352,7 @@ def main() -> int:
         return 1
 
     source_root = args.source.resolve()
-    print("PikPak transfer patch applied:")
+    print("OpenList patch bundle applied:")
     for path in changed:
         print(f"  {path.relative_to(source_root).as_posix()}")
     return 0

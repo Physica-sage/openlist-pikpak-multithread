@@ -236,10 +236,14 @@ jobs:
               drivers/pikpak/transfer_config.go \
               drivers/pikpak/transfer_config_test.go \
               internal/model/args.go \
+              internal/op/fs.go \
               internal/op/link_cache_type.go \
               internal/op/link_cache_type_test.go \
+              internal/op/objs_update_hook_batch.go \
+              internal/op/objs_update_hook_batch_test.go \
               internal/fs/copy_move.go \
-              internal/offline_download/tool/transfer.go
+              internal/offline_download/tool/transfer.go \
+              server/handles/fsmanage.go
           )
           if (( ${#unformatted[@]} > 0 )); then
             printf 'Unformatted Go file: %s\n' "${unformatted[@]}" >&2
@@ -253,6 +257,7 @@ jobs:
           go test ./internal/op
           go test ./internal/fs
           go test ./internal/offline_download/tool
+          go test ./server/handles
 
   publish:
     name: Build and publish image
@@ -342,7 +347,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.resolve.outputs.exact_tag }}
-            org.opencontainers.image.title=OpenList PikPak multithread transfer build
+            org.opencontainers.image.title=OpenList PikPak multithread and STRM batch hook fix build
             io.github.openlist.upstream-revision=${{ needs.resolve.outputs.upstream_sha }}
             io.github.openlist.upstream-tag=${{ needs.resolve.outputs.upstream_tag }}
           cache-from: type=gha,scope=openlist-pikpak
