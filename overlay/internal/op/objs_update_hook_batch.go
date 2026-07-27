@@ -3,9 +3,20 @@ package op
 import (
 	"context"
 	"fmt"
+	"os"
+	stdpath "path"
+	"strconv"
+	"strings"
 	"sync"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+)
+
+const (
+	objsUpdateHookBatchConcurrencyEnv = "OPENLIST_BATCH_HOOK_CONCURRENCY"
+	defaultObjsUpdateHookConcurrency  = 2
+	maxObjsUpdateHookConcurrency      = 4
 )
 
 type objsUpdateHookBatchContextKey struct{}
@@ -17,7 +28,8 @@ type objsUpdateHookTarget struct {
 }
 
 // ObjsUpdateHookBatch collects successful direct-operation hook targets and
-// dispatches them sequentially after a batch request has finished.
+// dispatches non-overlapping targets with bounded concurrency after a batch
+// request has finished.
 type ObjsUpdateHookBatch struct {
 	mu         sync.Mutex
 	targets    []objsUpdateHookTarget
@@ -46,21 +58,70 @@ func (b *ObjsUpdateHookBatch) add(storage driver.Driver, dirPath string, recursi
 	if b.dispatched {
 		return false
 	}
-	key := fmt.Sprintf("%p\x00%s\x00%t", storage.GetStorage(), dirPath, recursive)
+	cleanedPath := stdpath.Clean(dirPath)
+	key := fmt.Sprintf("%p\x00%s\x00%t", storage.GetStorage(), cleanedPath, recursive)
 	if _, ok := b.seen[key]; ok {
 		return true
 	}
 	b.seen[key] = struct{}{}
 	b.targets = append(b.targets, objsUpdateHookTarget{
 		storage:   storage,
-		dirPath:   dirPath,
+		dirPath:   cleanedPath,
 		recursive: recursive,
 	})
 	return true
 }
 
-// Dispatch launches one ordered hook worker. Calling Dispatch more than once
-// is safe; only the first call consumes the collected targets.
+func objsUpdateHookBatchConcurrency() int {
+	value := strings.TrimSpace(os.Getenv(objsUpdateHookBatchConcurrencyEnv))
+	concurrency, err := strconv.Atoi(value)
+	if err != nil || concurrency < 1 || concurrency > maxObjsUpdateHookConcurrency {
+		return defaultObjsUpdateHookConcurrency
+	}
+	return concurrency
+}
+
+func objsUpdateHookRateLimitEnabled() bool {
+	item, err := GetSettingItemByKey(conf.HandleHookRateLimit)
+	if err != nil {
+		return true
+	}
+	if item == nil {
+		return false
+	}
+	limit, err := strconv.ParseFloat(strings.TrimSpace(item.Value), 64)
+	return err == nil && limit > 0
+}
+
+func objsUpdateHookPathContains(parent string, child string) bool {
+	parent = stdpath.Clean(parent)
+	child = stdpath.Clean(child)
+	if parent == child {
+		return true
+	}
+	if parent == "/" {
+		return strings.HasPrefix(child, "/")
+	}
+	return strings.HasPrefix(child, parent+"/")
+}
+
+func objsUpdateHookTargetsOverlap(targets []objsUpdateHookTarget) bool {
+	for i := range targets {
+		for j := i + 1; j < len(targets); j++ {
+			if targets[i].storage.GetStorage() != targets[j].storage.GetStorage() {
+				continue
+			}
+			if objsUpdateHookPathContains(targets[i].dirPath, targets[j].dirPath) ||
+				objsUpdateHookPathContains(targets[j].dirPath, targets[i].dirPath) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Dispatch launches a bounded set of hook workers. Calling Dispatch more than
+// once is safe; only the first call consumes the collected targets.
 func (b *ObjsUpdateHookBatch) Dispatch(ctx context.Context) {
 	if b == nil {
 		return
@@ -78,11 +139,25 @@ func (b *ObjsUpdateHookBatch) Dispatch(ctx context.Context) {
 		return
 	}
 	go func() {
-		for _, target := range targets {
-			if ctx.Err() != nil {
-				return
-			}
-			objsUpdateHook(ctx, target.storage, target.dirPath, target.recursive)
+		concurrency := min(objsUpdateHookBatchConcurrency(), len(targets))
+		if objsUpdateHookTargetsOverlap(targets) || objsUpdateHookRateLimitEnabled() {
+			concurrency = 1
 		}
+		jobs := make(chan objsUpdateHookTarget)
+		var workers sync.WaitGroup
+		workers.Add(concurrency)
+		for range concurrency {
+			go func() {
+				defer workers.Done()
+				for target := range jobs {
+					objsUpdateHook(ctx, target.storage, target.dirPath, target.recursive)
+				}
+			}()
+		}
+		for _, target := range targets {
+			jobs <- target
+		}
+		close(jobs)
+		workers.Wait()
 	}()
 }

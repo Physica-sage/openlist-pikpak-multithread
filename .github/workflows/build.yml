@@ -259,6 +259,10 @@ jobs:
           go test ./internal/offline_download/tool
           go test ./server/handles
 
+      - name: Race-test batch hook dispatch
+        working-directory: upstream
+        run: go test -race ./internal/op -run 'TestObjsUpdateHookBatch|TestObjsUpdateHookTargetsOverlap' -count=1
+
   publish:
     name: Build and publish image
     needs:

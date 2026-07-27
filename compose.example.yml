@@ -11,10 +11,10 @@ services:
     ports:
       - 172.17.0.1:11524:5244
     environment:
-      UMASK: "022"
-      PIKPAK_TRANSFER_CONCURRENCY: "10"
-      PIKPAK_TRANSFER_PART_SIZE_MB: "32"
-      MAX_CONCURRENCY: "64"
-      MAX_BLOCK_LIMIT: "64"
+      - UMASK=022
+      - PIKPAK_TRANSFER_CONCURRENCY=10
+      - PIKPAK_TRANSFER_PART_SIZE_MB=32
+      - OPENLIST_BATCH_HOOK_CONCURRENCY=2
+      - MAX_CONCURRENCY=64
+      - MAX_BLOCK_LIMIT=64
     restart: unless-stopped
-
