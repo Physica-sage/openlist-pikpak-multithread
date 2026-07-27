@@ -1,6 +1,7 @@
 package op
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,7 +17,25 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	log "github.com/sirupsen/logrus"
 )
+
+type lockedBatchHookLogBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBatchHookLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBatchHookLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
 
 type batchHookTestDriver struct {
 	model.Storage
@@ -279,6 +298,135 @@ func TestObjsUpdateHookBatchConcurrencyConfig(t *testing.T) {
 				t.Fatalf("concurrency = %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestObjsUpdateHookBatchDebugLogsLifecycle(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_DEBUG", "true")
+	oldHooks := objsUpdateHooks
+	Cache.ClearAll()
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	var output lockedBatchHookLogBuffer
+	log.SetOutput(&output)
+	log.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableColors: true})
+	log.SetLevel(log.InfoLevel)
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		Cache.ClearAll()
+		log.SetOutput(oldOutput)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	done := make(chan struct{}, 2)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, _ string, _ []model.Obj) { done <- struct{}{} },
+	}
+	storage := newBatchHookTestDriver(map[string]bool{"/": true, "/A": true, "/B": true})
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/A", false)
+	batch.add(storage, "/B", false)
+	batch.Dispatch(context.Background())
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for debug hook calls")
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(output.String(), "event=batch_complete") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	got := output.String()
+	for _, want := range []string{
+		"[batch-hook]",
+		"event=batch_start",
+		"targets=2",
+		"concurrency=2",
+		"event=scan_start",
+		"event=scan_done",
+		"event=hook_start",
+		"event=hook_done",
+		"event=batch_complete",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("debug logs do not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestObjsUpdateHookBatchDebugWatchdogNamesBlockedHookAndPath(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_DEBUG", "true")
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
+	oldHooks := objsUpdateHooks
+	oldInterval := objsUpdateHookBatchDebugStallInterval
+	objsUpdateHookBatchDebugStallInterval = 20 * time.Millisecond
+	Cache.ClearAll()
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	oldFormatter := logger.Formatter
+	oldLevel := logger.Level
+	var output lockedBatchHookLogBuffer
+	log.SetOutput(&output)
+	log.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableColors: true})
+	log.SetLevel(log.InfoLevel)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseAll()
+		objsUpdateHooks = oldHooks
+		objsUpdateHookBatchDebugStallInterval = oldInterval
+		Cache.ClearAll()
+		log.SetOutput(oldOutput)
+		log.SetFormatter(oldFormatter)
+		log.SetLevel(oldLevel)
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	started := make(chan struct{}, 2)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, _ string, _ []model.Obj) {
+			started <- struct{}{}
+			<-release
+		},
+	}
+	storage := newBatchHookTestDriver(map[string]bool{"/": true, "/A": true, "/B": true})
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/A", false)
+	batch.add(storage, "/B", false)
+	batch.Dispatch(context.Background())
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for blocked hooks to start")
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(output.String(), "event=hook_watchdog") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	got := output.String()
+	for _, want := range []string{"event=hook_watchdog", "active=2", "active_tasks=", "/test/A", "/test/B"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("watchdog logs do not contain %q:\n%s", want, got)
+		}
+	}
+	releaseAll()
+	deadline = time.Now().Add(2 * time.Second)
+	for !strings.Contains(output.String(), "event=batch_complete") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !strings.Contains(output.String(), "event=batch_complete") {
+		t.Fatalf("debug batch did not complete after releasing hooks:\n%s", output.String())
 	}
 }
 

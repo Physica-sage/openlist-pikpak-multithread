@@ -253,24 +253,33 @@ func (q *objsUpdateHookEventQueue) close() {
 }
 
 type objsUpdateHookLane struct {
+	name    string
 	queue   *objsUpdateHookEventQueue
 	workers sync.WaitGroup
+	debug   *objsUpdateHookBatchDebug
 }
 
-func newObjsUpdateHookLane(ctx context.Context, hook ObjsUpdateHook, concurrency int) *objsUpdateHookLane {
-	lane := &objsUpdateHookLane{queue: newObjsUpdateHookEventQueue()}
+func newObjsUpdateHookLane(ctx context.Context, hook ObjsUpdateHook, name string, concurrency int, debug *objsUpdateHookBatchDebug) *objsUpdateHookLane {
+	lane := &objsUpdateHookLane{name: name, queue: newObjsUpdateHookEventQueue(), debug: debug}
 	lane.workers.Add(concurrency)
-	for range concurrency {
-		go func() {
+	for workerID := range concurrency {
+		go func(workerID int) {
 			defer lane.workers.Done()
 			for {
 				event, ok := lane.queue.take()
 				if !ok {
 					return
 				}
-				hook(ctx, event.parent, event.files)
+				started := lane.debug.hookStart(lane.name, workerID, event.parent)
+				hookCtx := withObjsUpdateHookDebugTrace(ctx, ObjsUpdateHookDebugTrace{
+					BatchID:  lane.debug.batchID,
+					HookName: lane.name,
+					WorkerID: workerID,
+				})
+				hook(hookCtx, event.parent, event.files)
+				lane.debug.hookDone(lane.name, workerID, event.parent, started)
 			}
-		}()
+		}(workerID)
 	}
 	return lane
 }
@@ -321,27 +330,37 @@ func handleObjsUpdateHookWork(ctx context.Context, work objsUpdateHookWork, limi
 
 func dispatchObjsUpdateHookTargets(ctx context.Context, targets []objsUpdateHookTarget, concurrency int, limiter *rate.Limiter) {
 	hooks := append([]ObjsUpdateHook(nil), objsUpdateHooks...)
+	limiterDescription := "disabled"
+	if limiter != nil {
+		limiterDescription = "enabled"
+	}
+	debug := newObjsUpdateHookBatchDebug(targets, concurrency, hooks, limiterDescription)
+	defer debug.complete()
 	lanes := make([]*objsUpdateHookLane, 0, len(hooks))
-	for _, hook := range hooks {
-		lanes = append(lanes, newObjsUpdateHookLane(ctx, hook, concurrency))
+	for index, hook := range hooks {
+		name := fmt.Sprintf("%d:%s", index, objsUpdateHookName(hook))
+		lanes = append(lanes, newObjsUpdateHookLane(ctx, hook, name, concurrency, debug))
 	}
 
 	queue := newObjsUpdateHookWorkQueue(targets)
 	var workers sync.WaitGroup
 	workers.Add(concurrency)
-	for range concurrency {
-		go func() {
+	for workerID := range concurrency {
+		go func(workerID int) {
 			defer workers.Done()
 			for {
 				work, ok := queue.take()
 				if !ok {
 					return
 				}
+				debug.scanStart(workerID, work)
+				scanStarted := time.Now()
 				event, children, err := handleObjsUpdateHookWork(ctx, work, limiter)
 				if err != nil {
 					work.listAttempts++
 					if work.listAttempts < maxObjsUpdateHookListAttempts {
 						delay := objsUpdateHookListRetryDelays[work.listAttempts-1]
+						debug.scanError(workerID, work, err, true, delay)
 						log.Warnf(
 							"batch hook list failed for %s (attempt %d/%d), retrying in %s: %v",
 							work.target.dirPath,
@@ -353,6 +372,7 @@ func dispatchObjsUpdateHookTargets(ctx context.Context, targets []objsUpdateHook
 						queue.retry(work, delay)
 						continue
 					}
+					debug.scanError(workerID, work, err, false, 0)
 					log.Errorf(
 						"batch hook list permanently failed for %s after %d attempts: %v",
 						work.target.dirPath,
@@ -362,12 +382,14 @@ func dispatchObjsUpdateHookTargets(ctx context.Context, targets []objsUpdateHook
 					queue.finish(work, nil)
 					continue
 				}
+				debug.scanDone(workerID, work, len(event.files), len(children), time.Since(scanStarted))
 				for _, lane := range lanes {
+					debug.hookQueued(lane.name, event.parent)
 					lane.queue.push(event)
 				}
 				queue.finish(work, children)
 			}
-		}()
+		}(workerID)
 	}
 	workers.Wait()
 	closeObjsUpdateHookLanes(lanes)

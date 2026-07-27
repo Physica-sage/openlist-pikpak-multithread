@@ -89,6 +89,21 @@ class ApplyPatchTest(unittest.TestCase):
             self.assertIn("hookBatch.Dispatch", replacement.after)
             self.assertNotIn("len(req.Names) > i+1", replacement.after)
 
+    def test_instruments_strm_hook_for_batch_diagnostics(self) -> None:
+        replacements = [
+            replacement
+            for replacement in PATCHER.REPLACEMENTS
+            if replacement.path == "drivers/strm/hook.go"
+        ]
+        self.assertEqual(len(replacements), 3)
+        patched = "\n".join(replacement.after for replacement in replacements)
+        self.assertIn("beginStrmHookDebug", patched)
+        self.assertIn("beginStrmLocalDebug", patched)
+        self.assertIn("beginStrmCleanupDebug", patched)
+        self.assertIn("newStrmObjectDebugTrace", patched)
+        self.assertTrue((PATCHER.OVERLAY_ROOT / "drivers/strm/hook_debug.go").is_file())
+        self.assertTrue((PATCHER.OVERLAY_ROOT / "drivers/strm/hook_debug_test.go").is_file())
+
     def test_prepare_replacements_combines_edits_to_the_same_file(self) -> None:
         root = Path(self.temp_dir.name)
         path = root / "shared.go"

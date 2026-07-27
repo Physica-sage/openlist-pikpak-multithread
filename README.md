@@ -28,8 +28,17 @@ STRM 增强位于 OpenList 通用文件操作和写入后钩子层，不依赖 P
 | `PIKPAK_TRANSFER_CONCURRENCY` | `10` | `0..64` | 每个活跃 RangeReader 的请求并发；`0` 关闭 PikPak 多线程 |
 | `PIKPAK_TRANSFER_PART_SIZE_MB` | `32` | `4..256` | 每个下载分片的大小，单位为 MiB |
 | `OPENLIST_BATCH_HOOK_CONCURRENCY` | `2` | `1..4` | 同批不重叠顶层目录的写入后钩子 worker 数；`1` 关闭目录并行 |
+| `OPENLIST_BATCH_HOOK_DEBUG` | `false` | `true/false` | 输出批次、扫描队列、每条 hook lane、STRM 单文件阶段及 30 秒 watchdog 诊断日志 |
 
-PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子并发参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
+PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子并发和诊断参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
+
+诊断时设置 `OPENLIST_BATCH_HOOK_DEBUG=true`。日志统一带 `[batch-hook]` 或 `[strm-hook]`：前者记录目标收集、目录 List、每条 hook lane 的入队/开始/完成和队列深度；后者记录 STRM 本地同步以及单个文件的 `link`、`range_read_compare`、`compare_content`、`range_read_write`、`create_local_file`、`copy_local_file` 阶段。批次未结束时每 30 秒输出一次 `scanner_watchdog` 和 `hook_watchdog`，其中 `active_tasks` 会列出仍占用 worker 的路径及持续时间。可用以下命令单独保存诊断日志：
+
+```bash
+docker logs -f openlist 2>&1 | grep --line-buffered -E '\[batch-hook\]|\[strm-hook\]' | tee openlist-batch-hook-debug.log
+```
+
+日志不记录媒体内容、访问令牌或实际直链，但会包含 OpenList 路径和本地 STRM 保存路径。问题复现并保存日志后可将该变量恢复为 `false`，避免长期产生较多逐文件日志。
 
 两个参数的组合还受每个活跃 RangeReader `2048 MiB` 的名义缓冲上限保护；超过时会保留并发数、自动降低分片大小并记录 warning。例如 `64 × 256 MiB` 会调整为 `64 × 32 MiB`。
 
@@ -108,6 +117,7 @@ services:
       - PIKPAK_TRANSFER_CONCURRENCY=10
       - PIKPAK_TRANSFER_PART_SIZE_MB=32
       - OPENLIST_BATCH_HOOK_CONCURRENCY=2
+      - OPENLIST_BATCH_HOOK_DEBUG=false
       - MAX_CONCURRENCY=64
       - MAX_BLOCK_LIMIT=64
     restart: unless-stopped
