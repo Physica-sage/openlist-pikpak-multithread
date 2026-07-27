@@ -198,6 +198,10 @@ func TestObjsUpdateHookBatchDispatchesEveryMovedDirectory(t *testing.T) {
 		Key:   conf.HandleHookAfterWriting,
 		Value: "true",
 	})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{
+		Key:   conf.HandleHookRateLimit,
+		Value: "0",
+	})
 
 	hooked := make(chan string, 4)
 	objsUpdateHooks = []ObjsUpdateHook{
@@ -341,7 +345,7 @@ func TestObjsUpdateHookBatchRunsIndependentTargetsConcurrently(t *testing.T) {
 	}
 }
 
-func TestObjsUpdateHookBatchSerializesWhenHookRateLimitIsEnabled(t *testing.T) {
+func TestObjsUpdateHookBatchKeepsConcurrencyWhenHookRateLimitIsEnabled(t *testing.T) {
 	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
 	oldHooks := objsUpdateHooks
 	Cache.ClearAll()
@@ -353,32 +357,19 @@ func TestObjsUpdateHookBatchSerializesWhenHookRateLimitIsEnabled(t *testing.T) {
 	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "1"})
 
 	started := make(chan string, 2)
-	firstRelease := make(chan struct{})
-	secondRelease := make(chan struct{})
-	var calls atomic.Int32
+	completed := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseAll)
+
 	objsUpdateHooks = []ObjsUpdateHook{
 		func(_ context.Context, parent string, _ []model.Obj) {
-			call := calls.Add(1)
 			started <- parent
-			if call == 1 {
-				<-firstRelease
-				return
-			}
-			<-secondRelease
+			<-release
+			completed <- struct{}{}
 		},
 	}
-	t.Cleanup(func() {
-		select {
-		case <-firstRelease:
-		default:
-			close(firstRelease)
-		}
-		select {
-		case <-secondRelease:
-		default:
-			close(secondRelease)
-		}
-	})
 
 	storage := newBatchHookTestDriver(map[string]bool{
 		"/":  true,
@@ -390,23 +381,85 @@ func TestObjsUpdateHookBatchSerializesWhenHookRateLimitIsEnabled(t *testing.T) {
 	batch.add(storage, "/B", false)
 	batch.Dispatch(context.Background())
 
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first rate-limited target did not start")
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("rate-limited target %d did not start with configured concurrency", i+1)
+		}
 	}
-	select {
-	case parent := <-started:
-		t.Fatalf("rate-limited target %q started before the first finished", parent)
-	case <-time.After(200 * time.Millisecond):
+	releaseAll()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-completed:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for rate-limited hooks to finish")
+		}
 	}
-	close(firstRelease)
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("second rate-limited target did not start after the first finished")
+}
+
+func TestObjsUpdateHookBatchStartsEveryTopLevelTargetBeforeBlockedDescendants(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
+	oldHooks := objsUpdateHooks
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	topStarted := make(chan string, 3)
+	allCalls := make(chan string, 5)
+	releaseDescendants := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(releaseDescendants) }) }
+	t.Cleanup(releaseAll)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			allCalls <- parent
+			switch parent {
+			case "/test/A", "/test/B", "/test/C":
+				topStarted <- parent
+			case "/test/A/child", "/test/B/child":
+				<-releaseDescendants
+			}
+		},
 	}
-	close(secondRelease)
+
+	storage := newBatchHookTestDriver(map[string]bool{
+		"/":        true,
+		"/A":       true,
+		"/A/child": true,
+		"/B":       true,
+		"/B/child": true,
+		"/C":       true,
+	})
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/A", true)
+	batch.add(storage, "/B", true)
+	batch.add(storage, "/C", true)
+	batch.Dispatch(context.Background())
+
+	gotTop := make(map[string]struct{}, 3)
+	for len(gotTop) < 3 {
+		select {
+		case parent := <-topStarted:
+			gotTop[parent] = struct{}{}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("later top-level target starved behind blocked descendants; started=%v", gotTop)
+		}
+	}
+	releaseAll()
+	gotCalls := make(map[string]struct{}, 5)
+	for len(gotCalls) < 5 {
+		select {
+		case parent := <-allCalls:
+			gotCalls[parent] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("not every directory hook completed; calls=%v", gotCalls)
+		}
+	}
 }
 
 func TestObjsUpdateHookBatchSerializesOverlappingTargets(t *testing.T) {
