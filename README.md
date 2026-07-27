@@ -1,11 +1,12 @@
-# OpenList PikPak 多线程转存版
+# OpenList PikPak 转存与 STRM 增强版
 
-这是一个非官方的 OpenList Docker 构建仓库。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR。
+这是一个非官方的 OpenList Docker 构建仓库，当前方向是增强 PikPak 内部转存以及 STRM 批量操作后的本地生成体验。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR。
 
-当前补丁包含两部分：
+当前补丁包含三部分：
 
 1. **PikPak 多线程转存**：只加速以 PikPak 为源的内部转存。
-2. **STRM 批量写入钩子修复**：同存储批量移动、复制或合并多个目录时，聚合每个成功项目的精确更新路径，避免只扫描最后一个目录而导致本地 `.strm` 落盘缺失。
+2. **STRM 批量写入钩子完整性修复**：同存储批量移动、复制或合并多个目录时，聚合每个成功项目的精确更新路径，避免只扫描最后一个目录而导致本地 `.strm` 落盘缺失。
+3. **STRM 批量目录有界并行**：对同批操作中路径互不重叠的顶层目录并行执行写入后钩子，减少多个独立媒体目录逐个扫描的等待时间。
 
 PikPak 多线程参数只作用于以下路径：
 
@@ -14,16 +15,21 @@ PikPak 多线程参数只作用于以下路径：
 - 普通代理下载、直链访问和媒体播放不启用这组参数。
 - 只作用于 `PikPak` 驱动，不作用于 `PikPak Share`。
 
-STRM 修复位于 OpenList 通用文件操作和写入后钩子层，不依赖 PikPak 驱动；关闭全局 `Handle hook after writing` 时不会增加扫描。跨存储异步任务仍由上游的 `TransferCoordinator` 在任务完成后触发钩子。
+STRM 增强位于 OpenList 通用文件操作和写入后钩子层，不依赖 PikPak 驱动；关闭全局 `Handle hook after writing` 时不会增加扫描。跨存储异步任务仍由上游的 `TransferCoordinator` 在任务完成后触发钩子。
+
+批量目录并行只覆盖本补丁接管的**同存储批量移动、复制和合并**。它不会改变单个目录内部的上游深度优先递归方式，也不会改变手动 STRM 扫描。调度前会清洗并去重路径；同一存储中只要出现相同路径、父子路径或根目录重叠，整批会保守地退回串行。OpenList 的 `Handle hook rate limit` 大于 `0` 时也会自动串行，避免每个 worker 建立独立 limiter 后放大总请求速率。
+
+这里的 STRM 本地保存不是 OpenList 的网盘“复制”任务：视频和音频通常只在服务器本地生成包含播放 URL 的小型 `.strm` 文本；`ass`、`srt`、`vtt`、`sub` 等下载类型才会读取源文件并保存到本地。
 
 ## 默认参数
 
 | 环境变量 | 默认值 | 有效范围 | 说明 |
 | --- | ---: | ---: | --- |
-| `PIKPAK_TRANSFER_CONCURRENCY` | `10` | `0..64` | 每个活跃 RangeReader 的请求并发；`0` 关闭补丁 |
+| `PIKPAK_TRANSFER_CONCURRENCY` | `10` | `0..64` | 每个活跃 RangeReader 的请求并发；`0` 关闭 PikPak 多线程 |
 | `PIKPAK_TRANSFER_PART_SIZE_MB` | `32` | `4..256` | 每个下载分片的大小，单位为 MiB |
+| `OPENLIST_BATCH_HOOK_CONCURRENCY` | `2` | `1..4` | 同批不重叠顶层目录的写入后钩子 worker 数；`1` 关闭目录并行 |
 
-变量只在第一次 PikPak 转存时读取。空值使用默认值；非法、负数或越界值会记录一次 warning 并回退默认值。修改变量后需要重启容器。
+PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子并发参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
 
 两个参数的组合还受每个活跃 RangeReader `2048 MiB` 的名义缓冲上限保护；超过时会保留并发数、自动降低分片大小并记录 warning。例如 `64 × 256 MiB` 会调整为 `64 × 32 MiB`。
 
@@ -98,13 +104,16 @@ services:
     ports:
       - 172.17.0.1:11524:5244
     environment:
-      UMASK: "022"
-      PIKPAK_TRANSFER_CONCURRENCY: "10"
-      PIKPAK_TRANSFER_PART_SIZE_MB: "32"
-      MAX_CONCURRENCY: "64"
-      MAX_BLOCK_LIMIT: "64"
+      - UMASK=022
+      - PIKPAK_TRANSFER_CONCURRENCY=10
+      - PIKPAK_TRANSFER_PART_SIZE_MB=32
+      - OPENLIST_BATCH_HOOK_CONCURRENCY=2
+      - MAX_CONCURRENCY=64
+      - MAX_BLOCK_LIMIT=64
     restart: unless-stopped
 ```
+
+示例统一使用你已实际验证可正常启动的 Compose 环境变量列表语法，并保留 `- UMASK=022`。Compose 规范上列表与映射写法通常等价；这里不把先前启动失败归因于 YAML 语法本身，而是采用已验证可用的部署形式。修改这些值后建议使用 `--force-recreate` 重新创建容器，而不只是 restart。
 
 更新容器：
 
