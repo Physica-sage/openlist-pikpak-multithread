@@ -8,11 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -20,7 +22,14 @@ const (
 	objsUpdateHookBatchConcurrencyEnv = "OPENLIST_BATCH_HOOK_CONCURRENCY"
 	defaultObjsUpdateHookConcurrency  = 2
 	maxObjsUpdateHookConcurrency      = 4
+	maxObjsUpdateHookListAttempts     = 4
 )
+
+var objsUpdateHookListRetryDelays = [...]time.Duration{
+	100 * time.Millisecond,
+	300 * time.Millisecond,
+	time.Second,
+}
 
 type objsUpdateHookBatchContextKey struct{}
 
@@ -127,25 +136,30 @@ func objsUpdateHookTargetsOverlap(targets []objsUpdateHookTarget) bool {
 }
 
 type objsUpdateHookWork struct {
-	target      objsUpdateHookTarget
-	rateLimited bool
+	target       objsUpdateHookTarget
+	rateLimited  bool
+	topLevel     bool
+	listAttempts int
 }
 
 type objsUpdateHookWorkQueue struct {
-	mu      sync.Mutex
-	ready   *sync.Cond
-	items   []objsUpdateHookWork
-	pending int
+	mu              sync.Mutex
+	ready           *sync.Cond
+	items           []objsUpdateHookWork
+	deferred        []objsUpdateHookWork
+	pending         int
+	topLevelPending int
 }
 
 func newObjsUpdateHookWorkQueue(targets []objsUpdateHookTarget) *objsUpdateHookWorkQueue {
 	queue := &objsUpdateHookWorkQueue{
-		items:   make([]objsUpdateHookWork, 0, len(targets)),
-		pending: len(targets),
+		items:           make([]objsUpdateHookWork, 0, len(targets)),
+		pending:         len(targets),
+		topLevelPending: len(targets),
 	}
 	queue.ready = sync.NewCond(&queue.mu)
 	for _, target := range targets {
-		queue.items = append(queue.items, objsUpdateHookWork{target: target})
+		queue.items = append(queue.items, objsUpdateHookWork{target: target, topLevel: true})
 	}
 	return queue
 }
@@ -164,28 +178,129 @@ func (q *objsUpdateHookWorkQueue) take() (objsUpdateHookWork, bool) {
 	return work, true
 }
 
-func (q *objsUpdateHookWorkQueue) finish(children []objsUpdateHookWork) {
+func (q *objsUpdateHookWorkQueue) retry(work objsUpdateHookWork, delay time.Duration) {
+	time.AfterFunc(delay, func() {
+		q.mu.Lock()
+		q.items = append(q.items, work)
+		q.ready.Signal()
+		q.mu.Unlock()
+	})
+}
+
+func (q *objsUpdateHookWorkQueue) finish(work objsUpdateHookWork, children []objsUpdateHookWork) {
 	q.mu.Lock()
 	q.pending += len(children) - 1
-	q.items = append(q.items, children...)
+	if work.topLevel {
+		q.topLevelPending--
+	}
+	if q.topLevelPending > 0 {
+		q.deferred = append(q.deferred, children...)
+	} else {
+		q.items = append(q.items, q.deferred...)
+		q.deferred = nil
+		q.items = append(q.items, children...)
+	}
 	q.ready.Broadcast()
 	q.mu.Unlock()
 }
 
-func handleObjsUpdateHookWork(ctx context.Context, work objsUpdateHookWork, limiter *rate.Limiter) []objsUpdateHookWork {
+type objsUpdateHookEvent struct {
+	parent string
+	files  []model.Obj
+}
+
+type objsUpdateHookEventQueue struct {
+	mu     sync.Mutex
+	ready  *sync.Cond
+	items  []objsUpdateHookEvent
+	closed bool
+}
+
+func newObjsUpdateHookEventQueue() *objsUpdateHookEventQueue {
+	queue := &objsUpdateHookEventQueue{}
+	queue.ready = sync.NewCond(&queue.mu)
+	return queue
+}
+
+func (q *objsUpdateHookEventQueue) push(event objsUpdateHookEvent) {
+	q.mu.Lock()
+	if !q.closed {
+		q.items = append(q.items, event)
+		q.ready.Signal()
+	}
+	q.mu.Unlock()
+}
+
+func (q *objsUpdateHookEventQueue) take() (objsUpdateHookEvent, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.items) == 0 && !q.closed {
+		q.ready.Wait()
+	}
+	if len(q.items) == 0 {
+		return objsUpdateHookEvent{}, false
+	}
+	event := q.items[0]
+	q.items = q.items[1:]
+	return event, true
+}
+
+func (q *objsUpdateHookEventQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.ready.Broadcast()
+	q.mu.Unlock()
+}
+
+type objsUpdateHookLane struct {
+	queue   *objsUpdateHookEventQueue
+	workers sync.WaitGroup
+}
+
+func newObjsUpdateHookLane(ctx context.Context, hook ObjsUpdateHook, concurrency int) *objsUpdateHookLane {
+	lane := &objsUpdateHookLane{queue: newObjsUpdateHookEventQueue()}
+	lane.workers.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer lane.workers.Done()
+			for {
+				event, ok := lane.queue.take()
+				if !ok {
+					return
+				}
+				hook(ctx, event.parent, event.files)
+			}
+		}()
+	}
+	return lane
+}
+
+func closeObjsUpdateHookLanes(lanes []*objsUpdateHookLane) {
+	for _, lane := range lanes {
+		lane.queue.close()
+	}
+	for _, lane := range lanes {
+		lane.workers.Wait()
+	}
+}
+
+func handleObjsUpdateHookWork(ctx context.Context, work objsUpdateHookWork, limiter *rate.Limiter) (objsUpdateHookEvent, []objsUpdateHookWork, error) {
 	if work.rateLimited && limiter != nil {
 		if err := limiter.Wait(ctx); err != nil {
-			return nil
+			return objsUpdateHookEvent{}, nil, err
 		}
 	}
 	target := work.target
 	files, err := List(ctx, target.storage, target.dirPath, model.ListArgs{SkipHook: true})
 	if err != nil {
-		return nil
+		return objsUpdateHookEvent{}, nil, err
 	}
-	HandleObjsUpdateHook(ctx, utils.GetFullPath(target.storage.GetStorage().MountPath, target.dirPath), files)
+	event := objsUpdateHookEvent{
+		parent: utils.GetFullPath(target.storage.GetStorage().MountPath, target.dirPath),
+		files:  files,
+	}
 	if !target.recursive {
-		return nil
+		return event, nil, nil
 	}
 	children := make([]objsUpdateHookWork, 0)
 	for _, file := range files {
@@ -201,10 +316,16 @@ func handleObjsUpdateHookWork(ctx context.Context, work objsUpdateHookWork, limi
 			rateLimited: true,
 		})
 	}
-	return children
+	return event, children, nil
 }
 
 func dispatchObjsUpdateHookTargets(ctx context.Context, targets []objsUpdateHookTarget, concurrency int, limiter *rate.Limiter) {
+	hooks := append([]ObjsUpdateHook(nil), objsUpdateHooks...)
+	lanes := make([]*objsUpdateHookLane, 0, len(hooks))
+	for _, hook := range hooks {
+		lanes = append(lanes, newObjsUpdateHookLane(ctx, hook, concurrency))
+	}
+
 	queue := newObjsUpdateHookWorkQueue(targets)
 	var workers sync.WaitGroup
 	workers.Add(concurrency)
@@ -216,11 +337,40 @@ func dispatchObjsUpdateHookTargets(ctx context.Context, targets []objsUpdateHook
 				if !ok {
 					return
 				}
-				queue.finish(handleObjsUpdateHookWork(ctx, work, limiter))
+				event, children, err := handleObjsUpdateHookWork(ctx, work, limiter)
+				if err != nil {
+					work.listAttempts++
+					if work.listAttempts < maxObjsUpdateHookListAttempts {
+						delay := objsUpdateHookListRetryDelays[work.listAttempts-1]
+						log.Warnf(
+							"batch hook list failed for %s (attempt %d/%d), retrying in %s: %v",
+							work.target.dirPath,
+							work.listAttempts,
+							maxObjsUpdateHookListAttempts,
+							delay,
+							err,
+						)
+						queue.retry(work, delay)
+						continue
+					}
+					log.Errorf(
+						"batch hook list permanently failed for %s after %d attempts: %v",
+						work.target.dirPath,
+						work.listAttempts,
+						err,
+					)
+					queue.finish(work, nil)
+					continue
+				}
+				for _, lane := range lanes {
+					lane.queue.push(event)
+				}
+				queue.finish(work, children)
 			}
 		}()
 	}
 	workers.Wait()
+	closeObjsUpdateHookLanes(lanes)
 }
 
 func dispatchObjsUpdateHookTargetsSequentially(ctx context.Context, targets []objsUpdateHookTarget) {

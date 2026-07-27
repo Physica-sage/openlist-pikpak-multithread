@@ -2,6 +2,8 @@ package op
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	stdpath "path"
 	"sort"
 	"strings"
@@ -18,8 +20,10 @@ import (
 
 type batchHookTestDriver struct {
 	model.Storage
-	mu      sync.Mutex
-	objects map[string]*model.Object
+	mu           sync.Mutex
+	objects      map[string]*model.Object
+	listFailures map[string]int
+	listAttempts map[string]int
 }
 
 func newBatchHookTestDriver(paths map[string]bool) *batchHookTestDriver {
@@ -30,7 +34,9 @@ func newBatchHookTestDriver(paths map[string]bool) *batchHookTestDriver {
 			CacheExpiration: 1,
 			Modified:        time.Now(),
 		},
-		objects: make(map[string]*model.Object, len(paths)),
+		objects:      make(map[string]*model.Object, len(paths)),
+		listFailures: make(map[string]int),
+		listAttempts: make(map[string]int),
 	}
 	for p, isDir := range paths {
 		cleaned := stdpath.Clean(p)
@@ -69,6 +75,11 @@ func (d *batchHookTestDriver) List(_ context.Context, dir model.Obj, _ model.Lis
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	parent := stdpath.Clean(dir.GetPath())
+	d.listAttempts[parent]++
+	if d.listFailures[parent] > 0 {
+		d.listFailures[parent]--
+		return nil, errors.New("transient list failure")
+	}
 	objs := make([]model.Obj, 0)
 	for p, obj := range d.objects {
 		if p == parent || stdpath.Dir(p) != parent {
@@ -458,6 +469,154 @@ func TestObjsUpdateHookBatchStartsEveryTopLevelTargetBeforeBlockedDescendants(t 
 			gotCalls[parent] = struct{}{}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("not every directory hook completed; calls=%v", gotCalls)
+		}
+	}
+}
+
+func TestObjsUpdateHookBatchRetriesTransientListFailures(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
+	oldHooks := objsUpdateHooks
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	hooked := make(chan string, 2)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			hooked <- parent
+		},
+	}
+	storage := newBatchHookTestDriver(map[string]bool{
+		"/":         true,
+		"/healthy":  true,
+		"/eventual": true,
+	})
+	storage.listFailures["/eventual"] = 2
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/eventual", false)
+	batch.add(storage, "/healthy", false)
+	batch.Dispatch(context.Background())
+
+	got := make(map[string]struct{}, 2)
+	for len(got) < 2 {
+		select {
+		case parent := <-hooked:
+			got[parent] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("transiently unavailable directory was dropped; hooks=%v attempts=%v", got, storage.listAttempts)
+		}
+	}
+	if attempts := storage.listAttempts["/eventual"]; attempts != 3 {
+		t.Fatalf("eventual list attempts = %d, want 3", attempts)
+	}
+}
+
+func TestObjsUpdateHookBatchRefillsWorkerWithoutBatchBarrier(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
+	oldHooks := objsUpdateHooks
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	started := make(chan string, 3)
+	releaseA := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseA) }) }
+	t.Cleanup(release)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			started <- parent
+			if parent == "/test/A" {
+				<-releaseA
+			}
+		},
+	}
+
+	storage := newBatchHookTestDriver(map[string]bool{
+		"/":  true,
+		"/A": true,
+		"/B": true,
+		"/C": true,
+	})
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/A", false)
+	batch.add(storage, "/B", false)
+	batch.add(storage, "/C", false)
+	batch.Dispatch(context.Background())
+
+	seen := make(map[string]struct{}, 3)
+	for len(seen) < 3 {
+		select {
+		case parent := <-started:
+			seen[parent] = struct{}{}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("worker was not refilled while A remained blocked; started=%v", seen)
+		}
+	}
+	if _, ok := seen["/test/C"]; !ok {
+		t.Fatalf("C did not start before blocked A completed: %v", seen)
+	}
+	release()
+}
+
+func TestObjsUpdateHookBatchSlowHookDoesNotBlockOtherHooks(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "4")
+	oldHooks := objsUpdateHooks
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	fastHookCalls := make(chan string, 9)
+	slowHookCalls := make(chan string, 9)
+	releaseSlowHook := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(releaseSlowHook) }) }
+	t.Cleanup(releaseAll)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			fastHookCalls <- parent
+		},
+		func(_ context.Context, parent string, _ []model.Obj) {
+			slowHookCalls <- parent
+			<-releaseSlowHook
+		},
+	}
+
+	paths := map[string]bool{"/": true}
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	storage := newBatchHookTestDriver(paths)
+	for i := 1; i <= 9; i++ {
+		path := fmt.Sprintf("/dir-%d", i)
+		storage.objects[path] = &model.Object{ID: path, Path: path, Name: stdpath.Base(path), IsFolder: true, Modified: time.Now()}
+		batch.add(storage, path, false)
+	}
+	batch.Dispatch(context.Background())
+
+	for i := 0; i < 9; i++ {
+		select {
+		case <-fastHookCalls:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("fast hook stalled after %d of 9 directories because another hook occupied the worker pool", i)
+		}
+	}
+	releaseAll()
+	for i := 0; i < 9; i++ {
+		select {
+		case <-slowHookCalls:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("slow hook did not eventually receive all directories; got %d of 9", i)
 		}
 	}
 }
