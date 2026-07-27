@@ -23,10 +23,16 @@ class ApplyPatchTest(unittest.TestCase):
         (root / "go.mod").write_text(
             "module github.com/OpenListTeam/OpenList/v4\n", encoding="utf-8"
         )
+        file_parts: dict[str, list[str]] = {}
         for replacement in PATCHER.REPLACEMENTS:
-            path = root / replacement.path
+            file_parts.setdefault(replacement.path, []).append(replacement.before)
+        for relative, anchors in file_parts.items():
+            path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"before\n{replacement.before}\nafter\n", encoding="utf-8")
+            path.write_text(
+                "before\n" + "\nbetween\n".join(anchors) + "\nafter\n",
+                encoding="utf-8",
+            )
         return root
 
     def setUp(self) -> None:
@@ -40,7 +46,8 @@ class ApplyPatchTest(unittest.TestCase):
         changed = PATCHER.apply_patch(root)
 
         overlay_count = sum(1 for path in PATCHER.OVERLAY_ROOT.rglob("*") if path.is_file())
-        self.assertEqual(len(changed), len(PATCHER.REPLACEMENTS) + overlay_count)
+        replacement_file_count = len({item.path for item in PATCHER.REPLACEMENTS})
+        self.assertEqual(len(changed), replacement_file_count + overlay_count)
         for replacement in PATCHER.REPLACEMENTS:
             content = (root / replacement.path).read_text(encoding="utf-8")
             self.assertNotIn(replacement.before, content)
@@ -69,6 +76,35 @@ class ApplyPatchTest(unittest.TestCase):
 
         with self.assertRaises(PATCHER.PatchError):
             PATCHER.apply_patch(root)
+
+    def test_batches_write_hooks_in_fs_handlers(self) -> None:
+        replacements = [
+            replacement
+            for replacement in PATCHER.REPLACEMENTS
+            if replacement.path == "server/handles/fsmanage.go"
+        ]
+        self.assertEqual(len(replacements), 2)
+        for replacement in replacements:
+            self.assertIn("op.WithObjsUpdateHookBatch", replacement.after)
+            self.assertIn("hookBatch.Dispatch", replacement.after)
+            self.assertNotIn("len(req.Names) > i+1", replacement.after)
+
+    def test_prepare_replacements_combines_edits_to_the_same_file(self) -> None:
+        root = Path(self.temp_dir.name)
+        path = root / "shared.go"
+        path.write_text("one\ntwo\n", encoding="utf-8")
+        original = PATCHER.REPLACEMENTS
+        PATCHER.REPLACEMENTS = (
+            PATCHER.Replacement("shared.go", "one", "ONE"),
+            PATCHER.Replacement("shared.go", "two", "TWO"),
+        )
+        try:
+            updates = PATCHER.prepare_replacements(root)
+        finally:
+            PATCHER.REPLACEMENTS = original
+
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][1], "ONE\nTWO\n")
 
 
 if __name__ == "__main__":
