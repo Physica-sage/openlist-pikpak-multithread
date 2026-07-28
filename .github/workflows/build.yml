@@ -383,6 +383,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           EXACT_TAG: ${{ needs.resolve.outputs.exact_tag }}
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
           UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
