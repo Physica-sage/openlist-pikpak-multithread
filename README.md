@@ -1,6 +1,6 @@
 # OpenList PikPak 转存与 STRM 增强版
 
-这是一个非官方的 OpenList Docker 构建仓库，当前方向是增强 PikPak 内部转存以及 STRM 批量操作后的本地生成体验。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR。
+这是一个非官方的 OpenList 构建仓库，当前方向是增强 PikPak 内部转存以及 STRM 批量操作后的本地生成体验。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR，并在 GitHub Release 提供同版本的 Linux AMD64/ARM64 二进制压缩包。
 
 当前补丁包含三部分：
 
@@ -79,6 +79,7 @@ OpenList Downloader 的内存量级约为每个活跃 RangeReader 的 `Concurren
 4. 精确检出上游源码并运行带断言的补丁器；任何锚点不匹配都会失败。
 5. 运行补丁器单测、Go 格式检查和受影响包的测试。
 6. 使用 Buildx 构建并发布 AMD64 与 ARM64 镜像。
+7. 并行构建 Linux AMD64 与 ARM64 二进制，生成 SHA-256 校验文件并发布到 GitHub Release。
 
 镜像会获得三类 tag：
 
@@ -89,6 +90,16 @@ ghcr.io/<owner>/<repo>:v4.2.4-u84ecda35aae2-p<补丁哈希>
 ```
 
 最后一种 tag 同时标识上游提交和补丁内容，适合固定部署版本。上游构建仍会获取当时的前端和基础镜像；需要严格冻结二进制时，应在部署中固定 Actions 构建摘要里的 manifest digest。手动勾选 `force_build` 会重新构建并覆盖同名精确 tag。新上游版本若与补丁冲突，Actions 会失败，已有的 `latest` 不会被新镜像覆盖。
+
+二进制 Release tag 使用 `patched-<精确镜像 tag>`，资产包括：
+
+```text
+openlist-<精确镜像 tag>-linux-amd64.tar.gz
+openlist-<精确镜像 tag>-linux-arm64.tar.gz
+SHA256SUMS
+```
+
+压缩包内的可执行文件名均为 `openlist`，已内嵌对应稳定版前端。二进制采用 `CGO_ENABLED=0` 构建，适合直接解压运行；容器部署仍建议使用 GHCR 多架构镜像。
 
 Actions 页面也可以手动运行工作流并填写某个稳定 tag，例如 `v4.2.3`。手动构建旧版本不会更新 `latest`，除非 tag 输入留空。
 

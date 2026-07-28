@@ -235,11 +235,15 @@ jobs:
               drivers/pikpak/driver.go \
               drivers/pikpak/transfer_config.go \
               drivers/pikpak/transfer_config_test.go \
+              drivers/strm/hook.go \
+              drivers/strm/hook_debug.go \
+              drivers/strm/hook_debug_test.go \
               internal/model/args.go \
               internal/op/fs.go \
               internal/op/link_cache_type.go \
               internal/op/link_cache_type_test.go \
               internal/op/objs_update_hook_batch.go \
+              internal/op/objs_update_hook_batch_debug.go \
               internal/op/objs_update_hook_batch_test.go \
               internal/fs/copy_move.go \
               internal/offline_download/tool/transfer.go \
@@ -254,6 +258,7 @@ jobs:
         working-directory: upstream
         run: |
           go test ./drivers/pikpak
+          go test ./drivers/strm
           go test ./internal/op
           go test ./internal/fs
           go test ./internal/offline_download/tool
@@ -262,6 +267,155 @@ jobs:
       - name: Race-test batch hook dispatch
         working-directory: upstream
         run: go test -race ./internal/op -run 'TestObjsUpdateHookBatch|TestObjsUpdateHookTargetsOverlap' -count=1
+
+  binary:
+    name: Build Linux binary (${{ matrix.arch }})
+    needs:
+      - resolve
+      - validate
+    if: github.event_name != 'pull_request' && needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check out OpenList
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify and patch upstream source
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actual_sha="$(git -C upstream rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Expected $EXPECTED_SHA, got $actual_sha" >&2
+            exit 1
+          fi
+          python3 scripts/apply_patch.py upstream
+          git -C upstream diff --check
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: upstream/go.mod
+          cache: true
+          cache-dependency-path: upstream/go.sum
+
+      - name: Build patched binary
+        id: package
+        working-directory: upstream
+        env:
+          ARCH: ${{ matrix.arch }}
+          EXACT_TAG: ${{ needs.resolve.outputs.exact_tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export GOOS=linux
+          export GOARCH="$ARCH"
+          export CGO_ENABLED=0
+
+          bash build.sh release docker
+
+          mkdir -p release
+          install -m 0755 bin/openlist release/openlist
+          archive="openlist-${EXACT_TAG}-linux-${ARCH}.tar.gz"
+          tar -C release -czf "release/$archive" openlist
+          (
+            cd release
+            sha256sum "$archive" > "$archive.sha256"
+          )
+
+          file release/openlist
+          if [[ "$ARCH" == "amd64" ]]; then
+            release/openlist version
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openlist-linux-${{ matrix.arch }}
+          path: |
+            upstream/release/${{ steps.package.outputs.archive }}
+            upstream/release/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish Linux binary release
+    needs:
+      - resolve
+      - validate
+      - binary
+    if: github.event_name != 'pull_request' && needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: openlist-linux-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          EXACT_TAG: ${{ needs.resolve.outputs.exact_tag }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_tag="patched-$EXACT_TAG"
+          find release-assets -maxdepth 1 -name '*.tar.gz.sha256' -type f -print0 |
+            sort -z |
+            xargs -0 cat > release-assets/SHA256SUMS
+
+          cat > release-notes.md <<EOF
+          Patched OpenList build for personal deployment.
+
+          - Upstream: \`$UPSTREAM_TAG\`
+          - Upstream commit: \`$UPSTREAM_SHA\`
+          - Patch revision: \`${GITHUB_SHA}\`
+          - Platforms: \`linux/amd64\`, \`linux/arm64\`
+          - Container image: \`ghcr.io/${GITHUB_REPOSITORY,,}:$EXACT_TAG\`
+          EOF
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release edit "$release_tag" \
+              --target "$GITHUB_SHA" \
+              --title "OpenList $UPSTREAM_TAG patched ($EXACT_TAG)" \
+              --notes-file release-notes.md
+            gh release upload "$release_tag" release-assets/* --clobber
+          else
+            gh release create "$release_tag" release-assets/* \
+              --target "$GITHUB_SHA" \
+              --title "OpenList $UPSTREAM_TAG patched ($EXACT_TAG)" \
+              --notes-file release-notes.md
+          fi
 
   publish:
     name: Build and publish image
