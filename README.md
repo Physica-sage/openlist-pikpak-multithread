@@ -32,11 +32,21 @@ STRM 增强位于 OpenList 通用文件操作和写入后钩子层，不依赖 P
 
 PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子并发和诊断参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
 
-诊断时设置 `OPENLIST_BATCH_HOOK_DEBUG=true`。日志统一带 `[batch-hook]` 或 `[strm-hook]`：前者记录目标收集、目录 List、每条 hook lane 的入队/开始/完成和队列深度；后者记录 STRM 本地同步以及单个文件的 `link`、`range_read_compare`、`compare_content`、`range_read_write`、`create_local_file`、`copy_local_file` 阶段。批次未结束时每 30 秒输出一次 `scanner_watchdog` 和 `hook_watchdog`，其中 `active_tasks` 会列出仍占用 worker 的路径及持续时间。可用以下命令单独保存诊断日志：
+诊断时设置 `OPENLIST_BATCH_HOOK_DEBUG=true`。日志统一带 `[batch-hook]` 或 `[strm-hook]`：前者记录目标收集、目录 List、每条 hook lane 的入队/开始/完成和队列深度；后者记录 STRM 本地同步以及单个文件的 `link`、`range_read_compare`、`compare_content`、`range_read_write`、`create_local_file`、`copy_local_file` 阶段。批次未结束时每 30 秒输出一次 `scanner_watchdog` 和 `hook_watchdog`，其中 `active_tasks` 会列出仍占用 worker 的路径及持续时间。
+
+OpenList 默认在 `init logrus...` 后把日志写入数据目录的 `log/log.log`，不再继续写 Docker stdout。因此使用默认配置时，不要用 `docker logs` 收集诊断信息；在 Compose 目录中直接跟踪挂载出来的日志文件：
 
 ```bash
-docker logs -f openlist 2>&1 | grep --line-buffered -E '\[batch-hook\]|\[strm-hook\]' | tee openlist-batch-hook-debug.log
+tail -n 0 -F ./data/log/log.log 2>&1 | grep --line-buffered -aE '\[batch-hook\]|\[strm-hook\]' | tee openlist-batch-hook-debug.log
 ```
+
+若问题已经发生，可先从当前日志文件提取已有记录：
+
+```bash
+grep -aE '\[batch-hook\]|\[strm-hook\]' ./data/log/log.log > openlist-batch-hook-debug.log
+```
+
+只有以 `--log-std`、debug 或 dev 模式启动时，这些日志才会同时出现在 `docker logs`。
 
 日志不记录媒体内容、访问令牌或实际直链，但会包含 OpenList 路径和本地 STRM 保存路径。问题复现并保存日志后可将该变量恢复为 `false`，避免长期产生较多逐文件日志。
 
