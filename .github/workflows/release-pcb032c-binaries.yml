@@ -1,0 +1,182 @@
+name: Release legacy single-thread binaries
+
+on:
+  push:
+    branches:
+      - release/pcb032c-binaries
+    paths:
+      - ".github/workflows/release-pcb032c-binaries.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: OpenListTeam/OpenList
+  UPSTREAM_TAG: v4.2.4
+  UPSTREAM_SHA: 84ecda35aae2bd0020474086e6ddfd3aa2340679
+  PATCH_SOURCE_SHA: aed44992b948d67327ba8a878e23780977cd262f
+  EXACT_TAG: v4.2.4-u84ecda35aae2-pcb032c2581e8
+  RELEASE_TAG: patched-v4.2.4-u84ecda35aae2-pcb032c2581e8
+
+jobs:
+  binary:
+    name: Build legacy Linux binary (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    steps:
+      - name: Check out legacy patch source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.PATCH_SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Verify legacy patch identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -d '' patch_files < <(
+            find overlay scripts/apply_patch.py -type f -print0 | sort -z
+          )
+          patch_id="$(
+            sha256sum "${patch_files[@]}" |
+              sha256sum |
+              cut -c1-12
+          )"
+          if [[ "$patch_id" != "cb032c2581e8" ]]; then
+            echo "Expected legacy patch cb032c2581e8, got $patch_id" >&2
+            exit 1
+          fi
+
+      - name: Check out OpenList
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_TAG }}
+          path: upstream
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify and patch upstream source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          actual_sha="$(git -C upstream rev-parse HEAD)"
+          if [[ "$actual_sha" != "$UPSTREAM_SHA" ]]; then
+            echo "Expected $UPSTREAM_SHA, got $actual_sha" >&2
+            exit 1
+          fi
+          python3 scripts/apply_patch.py upstream
+          git -C upstream diff --check
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: upstream/go.mod
+          cache: true
+          cache-dependency-path: upstream/go.sum
+
+      - name: Build and package static binary
+        id: package
+        working-directory: upstream
+        env:
+          ARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export GOOS=linux
+          export GOARCH="$ARCH"
+          export CGO_ENABLED=0
+
+          bash build.sh release docker
+
+          mkdir -p release
+          install -m 0755 bin/openlist release/openlist
+          archive="openlist-${EXACT_TAG}-linux-${ARCH}.tar.gz"
+          tar -C release -czf "release/$archive" openlist
+          sha256sum "release/$archive" > "release/$archive.sha256"
+
+          file release/openlist
+          if file release/openlist | grep -qi "dynamically linked"; then
+            echo "Expected a static binary" >&2
+            exit 1
+          fi
+          if [[ "$ARCH" == "amd64" ]]; then
+            release/openlist version
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: legacy-openlist-linux-${{ matrix.arch }}
+          path: |
+            upstream/release/${{ steps.package.outputs.archive }}
+            upstream/release/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish legacy binary release
+    needs: binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: legacy-openlist-linux-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify checksums and publish release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat release-assets/*.tar.gz.sha256 |
+            sed 's#release-assets/##g' > release-assets/SHA256SUMS
+          (
+            cd release-assets
+            sha256sum -c SHA256SUMS
+          )
+
+          notes="$(cat <<EOF
+          Stable legacy single-thread STRM batch-hook build requested for immediate use.
+
+          - OpenList upstream: \`$UPSTREAM_TAG\` (\`$UPSTREAM_SHA\`)
+          - Patch source: \`$PATCH_SOURCE_SHA\`
+          - Patch identity: \`cb032c2581e8\`
+          - Architectures: Linux AMD64 and Linux ARM64
+          - Packaging: static \`CGO_ENABLED=0\` binaries with embedded frontend
+
+          This is the earlier sequential batch-hook implementation. It is intentionally separate from the newer parallel scheduler release.
+          EOF
+          )"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "OpenList v4.2.4 patched legacy single-thread (pcb032c2581e8)" \
+              --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$PATCH_SOURCE_SHA" \
+              --title "OpenList v4.2.4 patched legacy single-thread (pcb032c2581e8)" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            release-assets/*.tar.gz \
+            release-assets/SHA256SUMS \
+            --clobber
