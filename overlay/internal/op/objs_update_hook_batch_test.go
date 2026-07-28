@@ -39,10 +39,11 @@ func (b *lockedBatchHookLogBuffer) String() string {
 
 type batchHookTestDriver struct {
 	model.Storage
-	mu           sync.Mutex
-	objects      map[string]*model.Object
-	listFailures map[string]int
-	listAttempts map[string]int
+	mu                sync.Mutex
+	objects           map[string]*model.Object
+	listFailures      map[string]int
+	listFailureErrors map[string]error
+	listAttempts      map[string]int
 }
 
 func newBatchHookTestDriver(paths map[string]bool) *batchHookTestDriver {
@@ -53,9 +54,10 @@ func newBatchHookTestDriver(paths map[string]bool) *batchHookTestDriver {
 			CacheExpiration: 1,
 			Modified:        time.Now(),
 		},
-		objects:      make(map[string]*model.Object, len(paths)),
-		listFailures: make(map[string]int),
-		listAttempts: make(map[string]int),
+		objects:           make(map[string]*model.Object, len(paths)),
+		listFailures:      make(map[string]int),
+		listFailureErrors: make(map[string]error),
+		listAttempts:      make(map[string]int),
 	}
 	for p, isDir := range paths {
 		cleaned := stdpath.Clean(p)
@@ -97,6 +99,9 @@ func (d *batchHookTestDriver) List(_ context.Context, dir model.Obj, _ model.Lis
 	d.listAttempts[parent]++
 	if d.listFailures[parent] > 0 {
 		d.listFailures[parent]--
+		if err := d.listFailureErrors[parent]; err != nil {
+			return nil, err
+		}
 		return nil, errors.New("transient list failure")
 	}
 	objs := make([]model.Obj, 0)
@@ -660,6 +665,166 @@ func TestObjsUpdateHookBatchRetriesTransientListFailures(t *testing.T) {
 	}
 	if attempts := storage.listAttempts["/eventual"]; attempts != 3 {
 		t.Fatalf("eventual list attempts = %d, want 3", attempts)
+	}
+}
+
+func TestObjsUpdateHookBatchWaitsForEventuallyVisibleMoveTarget(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
+	t.Setenv("OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT", "1s")
+	oldHooks := objsUpdateHooks
+	oldDelays := objsUpdateHookListRetryDelays
+	objsUpdateHookListRetryDelays = [...]time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		objsUpdateHookListRetryDelays = oldDelays
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	hooked := make(chan string, 2)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			hooked <- parent
+		},
+	}
+	storage := newBatchHookTestDriver(map[string]bool{
+		"/":         true,
+		"/eventual": true,
+		"/healthy":  true,
+	})
+	storage.listFailures["/eventual"] = 4
+	storage.listFailureErrors["/eventual"] = errs.ObjectNotFound
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/eventual", false)
+	batch.add(storage, "/healthy", false)
+	batch.Dispatch(context.Background())
+
+	got := make(map[string]struct{}, 2)
+	deadline := time.After(2 * time.Second)
+	for len(got) < 2 {
+		select {
+		case parent := <-hooked:
+			got[parent] = struct{}{}
+		case <-deadline:
+			t.Fatalf("eventually visible move target was dropped; hooks=%v attempts=%v", got, storage.listAttempts)
+		}
+	}
+	if _, ok := got["/test/eventual"]; !ok {
+		t.Fatalf("eventually visible target was not hooked: %v", got)
+	}
+	if attempts := storage.listAttempts["/eventual"]; attempts != 5 {
+		t.Fatalf("eventual target attempts = %d, want 5", attempts)
+	}
+}
+
+func TestObjsUpdateHookBatchProcessesDescendantsWhileTopLevelRetryWaits(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "2")
+	t.Setenv("OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT", "2s")
+	oldHooks := objsUpdateHooks
+	oldDelays := objsUpdateHookListRetryDelays
+	objsUpdateHookListRetryDelays = [...]time.Duration{750 * time.Millisecond, 750 * time.Millisecond, 750 * time.Millisecond}
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		objsUpdateHookListRetryDelays = oldDelays
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	startedAt := time.Now()
+	hooked := make(chan string, 3)
+	var childDelay time.Duration
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			if parent == "/test/healthy/child" {
+				childDelay = time.Since(startedAt)
+			}
+			hooked <- parent
+		},
+	}
+	storage := newBatchHookTestDriver(map[string]bool{
+		"/":              true,
+		"/slow":          true,
+		"/healthy":       true,
+		"/healthy/child": true,
+	})
+	storage.listFailures["/slow"] = 1
+	storage.listFailureErrors["/slow"] = errs.ObjectNotFound
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	batch.add(storage, "/slow", false)
+	batch.add(storage, "/healthy", true)
+	batch.Dispatch(context.Background())
+
+	got := make(map[string]struct{}, 3)
+	deadline := time.After(3 * time.Second)
+	for len(got) < 3 {
+		select {
+		case parent := <-hooked:
+			got[parent] = struct{}{}
+		case <-deadline:
+			t.Fatalf("not every hook completed while top-level retry waited; hooks=%v attempts=%v", got, storage.listAttempts)
+		}
+	}
+	if childDelay >= 500*time.Millisecond {
+		t.Fatalf("healthy descendant waited %s for unrelated top-level retry", childDelay)
+	}
+}
+
+func TestObjsUpdateHookBatchCompletesFourteenTargetsWithSixDelayed(t *testing.T) {
+	t.Setenv("OPENLIST_BATCH_HOOK_CONCURRENCY", "4")
+	t.Setenv("OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT", "1s")
+	oldHooks := objsUpdateHooks
+	oldDelays := objsUpdateHookListRetryDelays
+	objsUpdateHookListRetryDelays = [...]time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	Cache.ClearAll()
+	t.Cleanup(func() {
+		objsUpdateHooks = oldHooks
+		objsUpdateHookListRetryDelays = oldDelays
+		Cache.ClearAll()
+	})
+	Cache.SetSetting(conf.HandleHookAfterWriting, &model.SettingItem{Key: conf.HandleHookAfterWriting, Value: "true"})
+	Cache.SetSetting(conf.HandleHookRateLimit, &model.SettingItem{Key: conf.HandleHookRateLimit, Value: "0"})
+
+	hooked := make(chan string, 28)
+	objsUpdateHooks = []ObjsUpdateHook{
+		func(_ context.Context, parent string, _ []model.Obj) {
+			hooked <- parent
+		},
+	}
+	paths := map[string]bool{"/": true}
+	storage := newBatchHookTestDriver(paths)
+	_, batch := WithObjsUpdateHookBatch(context.Background())
+	for i := 1; i <= 14; i++ {
+		root := fmt.Sprintf("/dir-%02d", i)
+		child := root + "/child"
+		storage.objects[root] = &model.Object{ID: root, Path: root, Name: stdpath.Base(root), IsFolder: true, Modified: time.Now()}
+		storage.objects[child] = &model.Object{ID: child, Path: child, Name: "child", IsFolder: true, Modified: time.Now()}
+		if i > 8 {
+			storage.listFailures[root] = 4
+			storage.listFailureErrors[root] = errs.ObjectNotFound
+		}
+		batch.add(storage, root, true)
+	}
+	batch.Dispatch(context.Background())
+
+	got := make(map[string]struct{}, 28)
+	deadline := time.After(3 * time.Second)
+	for len(got) < 28 {
+		select {
+		case parent := <-hooked:
+			got[parent] = struct{}{}
+		case <-deadline:
+			t.Fatalf("14-target batch stopped after %d of 28 directory hooks; attempts=%v", len(got), storage.listAttempts)
+		}
+	}
+	for i := 9; i <= 14; i++ {
+		path := fmt.Sprintf("/dir-%02d", i)
+		if attempts := storage.listAttempts[path]; attempts != 5 {
+			t.Fatalf("delayed target %s attempts = %d, want 5", path, attempts)
+		}
 	}
 }
 

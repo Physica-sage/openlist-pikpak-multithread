@@ -12,6 +12,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	log "github.com/sirupsen/logrus"
@@ -20,9 +21,12 @@ import (
 
 const (
 	objsUpdateHookBatchConcurrencyEnv = "OPENLIST_BATCH_HOOK_CONCURRENCY"
+	objsUpdateHookNotFoundTimeoutEnv  = "OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT"
 	defaultObjsUpdateHookConcurrency  = 2
 	maxObjsUpdateHookConcurrency      = 4
 	maxObjsUpdateHookListAttempts     = 4
+	defaultObjsUpdateHookNotFoundWait = 10 * time.Minute
+	maxObjsUpdateHookNotFoundWait     = time.Hour
 )
 
 var objsUpdateHookListRetryDelays = [...]time.Duration{
@@ -140,26 +144,60 @@ type objsUpdateHookWork struct {
 	rateLimited  bool
 	topLevel     bool
 	listAttempts int
+	firstAttempt time.Time
+}
+
+func objsUpdateHookNotFoundTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv(objsUpdateHookNotFoundTimeoutEnv))
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 || timeout > maxObjsUpdateHookNotFoundWait {
+		return defaultObjsUpdateHookNotFoundWait
+	}
+	return timeout
+}
+
+func objsUpdateHookNotFoundRetryDelay(attempt int) time.Duration {
+	if attempt <= len(objsUpdateHookListRetryDelays) {
+		return objsUpdateHookListRetryDelays[attempt-1]
+	}
+	delay := objsUpdateHookListRetryDelays[len(objsUpdateHookListRetryDelays)-1]
+	for range attempt - len(objsUpdateHookListRetryDelays) {
+		delay *= 2
+		if delay >= 30*time.Second {
+			return 30 * time.Second
+		}
+	}
+	return delay
+}
+
+func objsUpdateHookListRetryDelay(work objsUpdateHookWork, err error) (time.Duration, bool) {
+	if work.topLevel && errs.IsObjectNotFound(err) {
+		delay := objsUpdateHookNotFoundRetryDelay(work.listAttempts)
+		return delay, time.Since(work.firstAttempt)+delay <= objsUpdateHookNotFoundTimeout()
+	}
+	if work.listAttempts < maxObjsUpdateHookListAttempts {
+		return objsUpdateHookListRetryDelays[work.listAttempts-1], true
+	}
+	return 0, false
 }
 
 type objsUpdateHookWorkQueue struct {
-	mu              sync.Mutex
-	ready           *sync.Cond
-	items           []objsUpdateHookWork
-	deferred        []objsUpdateHookWork
-	pending         int
-	topLevelPending int
+	mu             sync.Mutex
+	ready          *sync.Cond
+	topLevel       []objsUpdateHookWork
+	children       []objsUpdateHookWork
+	pending        int
+	topLevelActive int
 }
 
 func newObjsUpdateHookWorkQueue(targets []objsUpdateHookTarget) *objsUpdateHookWorkQueue {
 	queue := &objsUpdateHookWorkQueue{
-		items:           make([]objsUpdateHookWork, 0, len(targets)),
-		pending:         len(targets),
-		topLevelPending: len(targets),
+		topLevel: make([]objsUpdateHookWork, 0, len(targets)),
+		pending:  len(targets),
 	}
 	queue.ready = sync.NewCond(&queue.mu)
 	for _, target := range targets {
-		queue.items = append(queue.items, objsUpdateHookWork{target: target, topLevel: true})
+		queue.topLevel = append(queue.topLevel, objsUpdateHookWork{target: target, topLevel: true})
 	}
 	return queue
 }
@@ -167,21 +205,37 @@ func newObjsUpdateHookWorkQueue(targets []objsUpdateHookTarget) *objsUpdateHookW
 func (q *objsUpdateHookWorkQueue) take() (objsUpdateHookWork, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for len(q.items) == 0 && q.pending > 0 {
+	for q.pending > 0 {
+		if len(q.topLevel) > 0 {
+			work := q.topLevel[0]
+			q.topLevel = q.topLevel[1:]
+			q.topLevelActive++
+			return work, true
+		}
+		if q.topLevelActive == 0 && len(q.children) > 0 {
+			work := q.children[0]
+			q.children = q.children[1:]
+			return work, true
+		}
 		q.ready.Wait()
 	}
-	if q.pending == 0 {
-		return objsUpdateHookWork{}, false
-	}
-	work := q.items[0]
-	q.items = q.items[1:]
-	return work, true
+	return objsUpdateHookWork{}, false
 }
 
 func (q *objsUpdateHookWorkQueue) retry(work objsUpdateHookWork, delay time.Duration) {
+	if work.topLevel {
+		q.mu.Lock()
+		q.topLevelActive--
+		q.ready.Broadcast()
+		q.mu.Unlock()
+	}
 	time.AfterFunc(delay, func() {
 		q.mu.Lock()
-		q.items = append(q.items, work)
+		if work.topLevel {
+			q.topLevel = append(q.topLevel, work)
+		} else {
+			q.children = append(q.children, work)
+		}
 		q.ready.Signal()
 		q.mu.Unlock()
 	})
@@ -191,15 +245,9 @@ func (q *objsUpdateHookWorkQueue) finish(work objsUpdateHookWork, children []obj
 	q.mu.Lock()
 	q.pending += len(children) - 1
 	if work.topLevel {
-		q.topLevelPending--
+		q.topLevelActive--
 	}
-	if q.topLevelPending > 0 {
-		q.deferred = append(q.deferred, children...)
-	} else {
-		q.items = append(q.items, q.deferred...)
-		q.deferred = nil
-		q.items = append(q.items, children...)
-	}
+	q.children = append(q.children, children...)
 	q.ready.Broadcast()
 	q.mu.Unlock()
 }
@@ -353,19 +401,20 @@ func dispatchObjsUpdateHookTargets(ctx context.Context, targets []objsUpdateHook
 				if !ok {
 					return
 				}
+				if work.firstAttempt.IsZero() {
+					work.firstAttempt = time.Now()
+				}
 				debug.scanStart(workerID, work)
 				scanStarted := time.Now()
 				event, children, err := handleObjsUpdateHookWork(ctx, work, limiter)
 				if err != nil {
 					work.listAttempts++
-					if work.listAttempts < maxObjsUpdateHookListAttempts {
-						delay := objsUpdateHookListRetryDelays[work.listAttempts-1]
+					if delay, retry := objsUpdateHookListRetryDelay(work, err); retry {
 						debug.scanError(workerID, work, err, true, delay)
 						log.Warnf(
-							"batch hook list failed for %s (attempt %d/%d), retrying in %s: %v",
+							"batch hook list failed for %s (attempt %d), retrying in %s: %v",
 							work.target.dirPath,
 							work.listAttempts,
-							maxObjsUpdateHookListAttempts,
 							delay,
 							err,
 						)
