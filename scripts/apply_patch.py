@@ -280,6 +280,156 @@ REPLACEMENTS = (
         """\tlink, srcFile, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{})""",
         """\tlink, srcFile, err := op.Link(t.Ctx(), t.SrcStorage, t.SrcActualPath, model.LinkArgs{InternalTransfer: true})""",
     ),
+    Replacement(
+        "drivers/strm/hook.go",
+        """func UpdateLocalStrm(ctx context.Context, path string, objs []model.Obj) {
+\tpath = utils.FixAndCleanPath(path)
+\tupdateLocal := func(driver *Strm, basePath string, objs []model.Obj) {
+\t\trelParent := strings.TrimPrefix(basePath, utils.GetActualMountPath(driver.MountPath))
+\t\tlocalParentPath := stdpath.Join(driver.SaveStrmLocalPath, relParent)""",
+        """func UpdateLocalStrm(ctx context.Context, path string, objs []model.Obj) {
+\tpath = utils.FixAndCleanPath(path)
+\tfinishDebug := beginStrmHookDebug(ctx, path, len(objs))
+\tdefer finishDebug()
+\tupdateLocal := func(driver *Strm, basePath string, objs []model.Obj) {
+\t\trelParent := strings.TrimPrefix(basePath, utils.GetActualMountPath(driver.MountPath))
+\t\tlocalParentPath := stdpath.Join(driver.SaveStrmLocalPath, relParent)
+\t\tfinishLocalDebug := beginStrmLocalDebug(ctx, localParentPath, len(objs))
+\t\tdefer finishLocalDebug()""",
+    ),
+    Replacement(
+        "drivers/strm/hook.go",
+        """\t\tfor _, obj := range objs {
+\t\t\tlocalPath := stdpath.Join(localParentPath, obj.GetName())
+\t\t\tgenerateStrm(ctx, driver, obj, localPath)
+\t\t}
+\t\tdeleteExtraFiles(driver, localParentPath, objs)""",
+        """\t\tfor _, obj := range objs {
+\t\t\tlocalPath := stdpath.Join(localParentPath, obj.GetName())
+\t\t\tgenerateStrm(ctx, driver, obj, localPath)
+\t\t}
+\t\tfinishCleanupDebug := beginStrmCleanupDebug(ctx, localParentPath)
+\t\tdeleteExtraFiles(driver, localParentPath, objs)
+\t\tfinishCleanupDebug()""",
+    ),
+    Replacement(
+        "drivers/strm/hook.go",
+        """func generateStrm(ctx context.Context, driver *Strm, obj model.Obj, localPath string) {
+\tif !obj.IsDir() {
+\t\tif utils.Exists(localPath) && driver.SaveLocalMode == SaveLocalInsertMode {
+\t\t\treturn
+\t\t}
+\t\tlink, err := driver.Link(ctx, obj, model.LinkArgs{})
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to link: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer link.Close()
+\t\tsize := link.ContentLength
+\t\tif size <= 0 {
+\t\t\tsize = obj.GetSize()
+\t\t}
+\t\trrf, err := stream.GetRangeReaderFromLink(size, link)
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to get range reader: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\trc, err := rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to read range: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer rc.Close()
+\t\tsame, err := isSameContent(localPath, size, rc)
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to compare content of obj %s: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tif same {
+\t\t\treturn
+\t\t}
+\t\trc, err = rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to reread range: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer rc.Close()
+\t\tfile, err := utils.CreateNestedFile(localPath)
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create local file: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer file.Close()
+\t\tif _, err := utils.CopyWithBuffer(file, rc); err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: copy failed: %v\", localPath, err)
+\t\t}
+\t}
+}""",
+        """func generateStrm(ctx context.Context, driver *Strm, obj model.Obj, localPath string) {
+\tif !obj.IsDir() {
+\t\ttrace := newStrmObjectDebugTrace(ctx, localPath)
+\t\tdefer trace.done()
+\t\tif utils.Exists(localPath) && driver.SaveLocalMode == SaveLocalInsertMode {
+\t\t\ttrace.stage(\"already_exists\")
+\t\t\treturn
+\t\t}
+\t\ttrace.stage(\"link\")
+\t\tlink, err := driver.Link(ctx, obj, model.LinkArgs{})
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to link: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer link.Close()
+\t\tsize := link.ContentLength
+\t\tif size <= 0 {
+\t\t\tsize = obj.GetSize()
+\t\t}
+\t\ttrace.stage(\"range_reader\")
+\t\trrf, err := stream.GetRangeReaderFromLink(size, link)
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to get range reader: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\ttrace.stage(\"range_read_compare\")
+\t\trc, err := rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to read range: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer rc.Close()
+\t\ttrace.stage(\"compare_content\")
+\t\tsame, err := isSameContent(localPath, size, rc)
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to compare content of obj %s: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tif same {
+\t\t\ttrace.stage(\"unchanged\")
+\t\t\treturn
+\t\t}
+\t\ttrace.stage(\"range_read_write\")
+\t\trc, err = rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to reread range: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer rc.Close()
+\t\ttrace.stage(\"create_local_file\")
+\t\tfile, err := utils.CreateNestedFile(localPath)
+\t\tif err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create local file: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\tdefer file.Close()
+\t\ttrace.stage(\"copy_local_file\")
+\t\tif _, err := utils.CopyWithBuffer(file, rc); err != nil {
+\t\t\tlog.Warnf(\"failed to generate strm of obj %s: copy failed: %v\", localPath, err)
+\t\t\treturn
+\t\t}
+\t\ttrace.stage(\"complete\")
+\t}
+}""",
+    ),
 )
 
 

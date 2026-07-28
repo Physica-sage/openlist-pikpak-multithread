@@ -1,6 +1,6 @@
 # OpenList PikPak 转存与 STRM 增强版
 
-这是一个非官方的 OpenList Docker 构建仓库，当前方向是增强 PikPak 内部转存以及 STRM 批量操作后的本地生成体验。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR。
+这是一个非官方的 OpenList 构建仓库，当前方向是增强 PikPak 内部转存以及 STRM 批量操作后的本地生成体验。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR，并在 GitHub Release 提供同版本的 Linux AMD64/ARM64 二进制压缩包。
 
 当前补丁包含三部分：
 
@@ -17,7 +17,7 @@ PikPak 多线程参数只作用于以下路径：
 
 STRM 增强位于 OpenList 通用文件操作和写入后钩子层，不依赖 PikPak 驱动；关闭全局 `Handle hook after writing` 时不会增加扫描。跨存储异步任务仍由上游的 `TransferCoordinator` 在任务完成后触发钩子。
 
-批量目录并行只覆盖本补丁接管的**同存储批量移动、复制和合并**。它不会改变单个目录内部的上游深度优先递归方式，也不会改变手动 STRM 扫描。调度前会清洗并去重路径；同一存储中只要出现相同路径、父子路径或根目录重叠，整批会保守地退回串行。OpenList 的 `Handle hook rate limit` 大于 `0` 时也会自动串行，避免每个 worker 建立独立 limiter 后放大总请求速率。
+批量目录并行只覆盖本补丁接管的**同存储批量移动、复制和合并**，不会改变手动 STRM 扫描，也不依赖 PikPak 或其他特定源驱动。调度前会清洗并去重路径；同一存储中只要出现相同路径、父子路径或根目录重叠，整批会保守地使用上游原始串行递归。互不重叠时采用标准 worker pool：同一钩子中哪个目录先完成，空闲 worker 就立即补上下一个，不存在整批完成屏障。各注册钩子使用互相隔离的任务队列，因此搜索索引或其他慢钩子不会占住 STRM 本地生成的 worker。目录 List 瞬时失败会延迟回队尾重试，而不是静默丢弃整个目录；OpenList 的 `Handle hook rate limit` 大于 `0` 时所有扫描 worker 共用同一个 limiter，保留配置并发的同时不成倍放大 List 请求速率。
 
 这里的 STRM 本地保存不是 OpenList 的网盘“复制”任务：视频和音频通常只在服务器本地生成包含播放 URL 的小型 `.strm` 文本；`ass`、`srt`、`vtt`、`sub` 等下载类型才会读取源文件并保存到本地。
 
@@ -28,8 +28,30 @@ STRM 增强位于 OpenList 通用文件操作和写入后钩子层，不依赖 P
 | `PIKPAK_TRANSFER_CONCURRENCY` | `10` | `0..64` | 每个活跃 RangeReader 的请求并发；`0` 关闭 PikPak 多线程 |
 | `PIKPAK_TRANSFER_PART_SIZE_MB` | `32` | `4..256` | 每个下载分片的大小，单位为 MiB |
 | `OPENLIST_BATCH_HOOK_CONCURRENCY` | `2` | `1..4` | 同批不重叠顶层目录的写入后钩子 worker 数；`1` 关闭目录并行 |
+| `OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT` | `10m` | `>0..1h` | 同存储移动返回后目标目录仍不可见时，后台等待其最终可见的最长时间 |
+| `OPENLIST_BATCH_HOOK_DEBUG` | `false` | `true/false` | 输出批次、扫描队列、每条 hook lane、STRM 单文件阶段及 30 秒 watchdog 诊断日志 |
 
-PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子并发参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
+PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
+
+部分驱动的“移动”接口只负责向云端创建异步任务，接口返回成功时目标目录还不一定可见。批量钩子遇到顶层目标 `object not found` 时会以退避间隔继续检查，最长等待 `OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT`；其他 List 错误仍采用短重试。等待中的顶层目标不占 worker，也不会阻塞已经可见目录的子树处理；重试到期后会重新进入高优先队列。
+
+诊断时设置 `OPENLIST_BATCH_HOOK_DEBUG=true`。日志统一带 `[batch-hook]` 或 `[strm-hook]`：前者记录目标收集、目录 List、每条 hook lane 的入队/开始/完成和队列深度；后者记录 STRM 本地同步以及单个文件的 `link`、`range_read_compare`、`compare_content`、`range_read_write`、`create_local_file`、`copy_local_file` 阶段。批次未结束时每 30 秒输出一次 `scanner_watchdog` 和 `hook_watchdog`，其中 `active_tasks` 会列出仍占用 worker 的路径及持续时间。
+
+OpenList 默认在 `init logrus...` 后把日志写入数据目录的 `log/log.log`，不再继续写 Docker stdout。因此使用默认配置时，不要用 `docker logs` 收集诊断信息；在 Compose 目录中直接跟踪挂载出来的日志文件：
+
+```bash
+tail -n 0 -F ./data/log/log.log 2>&1 | grep --line-buffered -aE '\[batch-hook\]|\[strm-hook\]' | tee openlist-batch-hook-debug.log
+```
+
+若问题已经发生，可先从当前日志文件提取已有记录：
+
+```bash
+grep -aE '\[batch-hook\]|\[strm-hook\]' ./data/log/log.log > openlist-batch-hook-debug.log
+```
+
+只有以 `--log-std`、debug 或 dev 模式启动时，这些日志才会同时出现在 `docker logs`。
+
+日志不记录媒体内容、访问令牌或实际直链，但会包含 OpenList 路径和本地 STRM 保存路径。问题复现并保存日志后可将该变量恢复为 `false`，避免长期产生较多逐文件日志。
 
 两个参数的组合还受每个活跃 RangeReader `2048 MiB` 的名义缓冲上限保护；超过时会保留并发数、自动降低分片大小并记录 warning。例如 `64 × 256 MiB` 会调整为 `64 × 32 MiB`。
 
@@ -57,6 +79,7 @@ OpenList Downloader 的内存量级约为每个活跃 RangeReader 的 `Concurren
 4. 精确检出上游源码并运行带断言的补丁器；任何锚点不匹配都会失败。
 5. 运行补丁器单测、Go 格式检查和受影响包的测试。
 6. 使用 Buildx 构建并发布 AMD64 与 ARM64 镜像。
+7. 并行构建 Linux AMD64 与 ARM64 二进制，生成 SHA-256 校验文件并发布到 GitHub Release。
 
 镜像会获得三类 tag：
 
@@ -67,6 +90,16 @@ ghcr.io/<owner>/<repo>:v4.2.4-u84ecda35aae2-p<补丁哈希>
 ```
 
 最后一种 tag 同时标识上游提交和补丁内容，适合固定部署版本。上游构建仍会获取当时的前端和基础镜像；需要严格冻结二进制时，应在部署中固定 Actions 构建摘要里的 manifest digest。手动勾选 `force_build` 会重新构建并覆盖同名精确 tag。新上游版本若与补丁冲突，Actions 会失败，已有的 `latest` 不会被新镜像覆盖。
+
+二进制 Release tag 使用 `patched-<精确镜像 tag>`，资产包括：
+
+```text
+openlist-<精确镜像 tag>-linux-amd64.tar.gz
+openlist-<精确镜像 tag>-linux-arm64.tar.gz
+SHA256SUMS
+```
+
+压缩包内的可执行文件名均为 `openlist`，已内嵌对应稳定版前端。二进制采用 `CGO_ENABLED=0` 构建，适合直接解压运行；容器部署仍建议使用 GHCR 多架构镜像。
 
 Actions 页面也可以手动运行工作流并填写某个稳定 tag，例如 `v4.2.3`。手动构建旧版本不会更新 `latest`，除非 tag 输入留空。
 
@@ -108,6 +141,8 @@ services:
       - PIKPAK_TRANSFER_CONCURRENCY=10
       - PIKPAK_TRANSFER_PART_SIZE_MB=32
       - OPENLIST_BATCH_HOOK_CONCURRENCY=2
+      - OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT=10m
+      - OPENLIST_BATCH_HOOK_DEBUG=false
       - MAX_CONCURRENCY=64
       - MAX_BLOCK_LIMIT=64
     restart: unless-stopped
