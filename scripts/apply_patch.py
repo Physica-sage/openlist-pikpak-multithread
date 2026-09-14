@@ -315,119 +315,137 @@ REPLACEMENTS = (
     Replacement(
         "drivers/strm/hook.go",
         """func generateStrm(ctx context.Context, driver *Strm, obj model.Obj, localPath string) {
-\tif !obj.IsDir() {
-\t\tif utils.Exists(localPath) && driver.SaveLocalMode == SaveLocalInsertMode {
-\t\t\treturn
+\tif obj.IsDir() {
+\t\tif err := createLocalDirectory(localPath); err != nil {
+\t\t\tlog.Warnf(\"failed to create local strm directory %s: %v\", localPath, err)
 \t\t}
-\t\tlink, err := driver.Link(ctx, obj, model.LinkArgs{})
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to link: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer link.Close()
-\t\tsize := link.ContentLength
-\t\tif size <= 0 {
-\t\t\tsize = obj.GetSize()
-\t\t}
-\t\trrf, err := stream.GetRangeReaderFromLink(size, link)
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to get range reader: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\trc, err := rrf.RangeRead(ctx, http_range.Range{Length: -1})
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to read range: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer rc.Close()
-\t\tsame, err := isSameContent(localPath, size, rc)
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to compare content of obj %s: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tif same {
-\t\t\treturn
-\t\t}
-\t\trc, err = rrf.RangeRead(ctx, http_range.Range{Length: -1})
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to reread range: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer rc.Close()
-\t\tfile, err := utils.CreateNestedFile(localPath)
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create local file: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer file.Close()
-\t\tif _, err := utils.CopyWithBuffer(file, rc); err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: copy failed: %v\", localPath, err)
-\t\t}
+\t\treturn
+\t}
+
+\tif utils.Exists(localPath) && driver.SaveLocalMode == SaveLocalInsertMode {
+\t\treturn
+\t}
+\tlink, err := driver.Link(ctx, obj, model.LinkArgs{})
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to link: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer link.Close()
+\tsize := link.ContentLength
+\tif size <= 0 {
+\t\tsize = obj.GetSize()
+\t}
+\trrf, err := stream.GetRangeReaderFromLink(size, link)
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to get range reader: %v\", localPath, err)
+\t\treturn
+\t}
+\trc, err := rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to read range: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer rc.Close()
+\tsame, err := isSameContent(localPath, size, rc)
+\tif err != nil {
+\t\tlog.Warnf(\"failed to compare content of obj %s: %v\", localPath, err)
+\t\treturn
+\t}
+\tif same {
+\t\treturn
+\t}
+\trc, err = rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to reread range: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer rc.Close()
+\tif err := createLocalDirectory(filepath.Dir(localPath)); err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create parent directory: %v\", localPath, err)
+\t\treturn
+\t}
+\tfile, err := os.Create(localPath)
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create local file: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer file.Close()
+\tif _, err := utils.CopyWithBuffer(file, rc); err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: copy failed: %v\", localPath, err)
 \t}
 }""",
         """func generateStrm(ctx context.Context, driver *Strm, obj model.Obj, localPath string) {
-\tif !obj.IsDir() {
-\t\ttrace := newStrmObjectDebugTrace(ctx, localPath)
-\t\tdefer trace.done()
-\t\tif utils.Exists(localPath) && driver.SaveLocalMode == SaveLocalInsertMode {
-\t\t\ttrace.stage(\"already_exists\")
-\t\t\treturn
+\tif obj.IsDir() {
+\t\tif err := createLocalDirectory(localPath); err != nil {
+\t\t\tlog.Warnf(\"failed to create local strm directory %s: %v\", localPath, err)
 \t\t}
-\t\ttrace.stage(\"link\")
-\t\tlink, err := driver.Link(ctx, obj, model.LinkArgs{})
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to link: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer link.Close()
-\t\tsize := link.ContentLength
-\t\tif size <= 0 {
-\t\t\tsize = obj.GetSize()
-\t\t}
-\t\ttrace.stage(\"range_reader\")
-\t\trrf, err := stream.GetRangeReaderFromLink(size, link)
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to get range reader: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\ttrace.stage(\"range_read_compare\")
-\t\trc, err := rrf.RangeRead(ctx, http_range.Range{Length: -1})
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to read range: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer rc.Close()
-\t\ttrace.stage(\"compare_content\")
-\t\tsame, err := isSameContent(localPath, size, rc)
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to compare content of obj %s: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tif same {
-\t\t\ttrace.stage(\"unchanged\")
-\t\t\treturn
-\t\t}
-\t\ttrace.stage(\"range_read_write\")
-\t\trc, err = rrf.RangeRead(ctx, http_range.Range{Length: -1})
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to reread range: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer rc.Close()
-\t\ttrace.stage(\"create_local_file\")
-\t\tfile, err := utils.CreateNestedFile(localPath)
-\t\tif err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create local file: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\tdefer file.Close()
-\t\ttrace.stage(\"copy_local_file\")
-\t\tif _, err := utils.CopyWithBuffer(file, rc); err != nil {
-\t\t\tlog.Warnf(\"failed to generate strm of obj %s: copy failed: %v\", localPath, err)
-\t\t\treturn
-\t\t}
-\t\ttrace.stage(\"complete\")
+\t\treturn
 \t}
+
+\ttrace := newStrmObjectDebugTrace(ctx, localPath)
+\tdefer trace.done()
+\tif utils.Exists(localPath) && driver.SaveLocalMode == SaveLocalInsertMode {
+\t\ttrace.stage(\"already_exists\")
+\t\treturn
+\t}
+\ttrace.stage(\"link\")
+\tlink, err := driver.Link(ctx, obj, model.LinkArgs{})
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to link: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer link.Close()
+\tsize := link.ContentLength
+\tif size <= 0 {
+\t\tsize = obj.GetSize()
+\t}
+\ttrace.stage(\"range_reader\")
+\trrf, err := stream.GetRangeReaderFromLink(size, link)
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to get range reader: %v\", localPath, err)
+\t\treturn
+\t}
+\ttrace.stage(\"range_read_compare\")
+\trc, err := rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to read range: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer rc.Close()
+\ttrace.stage(\"compare_content\")
+\tsame, err := isSameContent(localPath, size, rc)
+\tif err != nil {
+\t\tlog.Warnf(\"failed to compare content of obj %s: %v\", localPath, err)
+\t\treturn
+\t}
+\tif same {
+\t\ttrace.stage(\"unchanged\")
+\t\treturn
+\t}
+\ttrace.stage(\"range_read_write\")
+\trc, err = rrf.RangeRead(ctx, http_range.Range{Length: -1})
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to reread range: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer rc.Close()
+\ttrace.stage(\"create_local_file\")
+\tif err := createLocalDirectory(filepath.Dir(localPath)); err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create parent directory: %v\", localPath, err)
+\t\treturn
+\t}
+\tfile, err := os.Create(localPath)
+\tif err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: failed to create local file: %v\", localPath, err)
+\t\treturn
+\t}
+\tdefer file.Close()
+\ttrace.stage(\"copy_local_file\")
+\tif _, err := utils.CopyWithBuffer(file, rc); err != nil {
+\t\tlog.Warnf(\"failed to generate strm of obj %s: copy failed: %v\", localPath, err)
+\t\treturn
+\t}
+\ttrace.stage(\"complete\")
 }""",
     ),
 )
