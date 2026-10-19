@@ -77,32 +77,60 @@ class ApplyPatchTest(unittest.TestCase):
         with self.assertRaises(PATCHER.PatchError):
             PATCHER.apply_patch(root)
 
-    def test_batches_write_hooks_in_fs_handlers(self) -> None:
-        replacements = [
-            replacement
-            for replacement in PATCHER.REPLACEMENTS
-            if replacement.path == "server/handles/fsmanage.go"
-        ]
-        self.assertEqual(len(replacements), 2)
-        for replacement in replacements:
-            self.assertIn("op.WithObjsUpdateHookBatch", replacement.after)
-            self.assertIn("hookBatch.Dispatch", replacement.after)
-            self.assertNotIn("len(req.Names) > i+1", replacement.after)
+    def test_patch_is_limited_to_pikpak_transfer(self) -> None:
+        self.assertEqual(
+            {replacement.path for replacement in PATCHER.REPLACEMENTS},
+            {
+                "drivers/pikpak/driver.go",
+                "internal/model/args.go",
+                "internal/op/fs.go",
+                "internal/fs/copy_move.go",
+                "internal/offline_download/tool/transfer.go",
+            },
+        )
+        self.assertEqual(
+            {
+                path.relative_to(PATCHER.OVERLAY_ROOT).as_posix()
+                for path in PATCHER.OVERLAY_ROOT.rglob("*")
+                if path.is_file()
+            },
+            {
+                "drivers/pikpak/transfer_config.go",
+                "drivers/pikpak/transfer_config_test.go",
+                "internal/op/link_cache_type.go",
+                "internal/op/link_cache_type_test.go",
+            },
+        )
+        for replacement in PATCHER.REPLACEMENTS:
+            self.assertNotIn("Hook", replacement.after)
 
-    def test_instruments_strm_hook_for_batch_diagnostics(self) -> None:
-        replacements = [
-            replacement
-            for replacement in PATCHER.REPLACEMENTS
-            if replacement.path == "drivers/strm/hook.go"
+    def test_preserves_strm_and_batch_handlers(self) -> None:
+        root = self.make_source()
+        untouched_paths = [
+            "drivers/strm/hook.go",
+            "server/handles/fsmanage.go",
+            "internal/task_group/transfer.go",
         ]
-        self.assertEqual(len(replacements), 3)
-        patched = "\n".join(replacement.after for replacement in replacements)
-        self.assertIn("beginStrmHookDebug", patched)
-        self.assertIn("beginStrmLocalDebug", patched)
-        self.assertIn("beginStrmCleanupDebug", patched)
-        self.assertIn("newStrmObjectDebugTrace", patched)
-        self.assertTrue((PATCHER.OVERLAY_ROOT / "drivers/strm/hook_debug.go").is_file())
-        self.assertTrue((PATCHER.OVERLAY_ROOT / "drivers/strm/hook_debug_test.go").is_file())
+        for relative in untouched_paths:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"unchanged upstream contents\n")
+        PATCHER.apply_patch(root)
+        for relative in untouched_paths:
+            self.assertEqual(
+                (root / relative).read_bytes(), b"unchanged upstream contents\n"
+            )
+
+    def test_cache_patch_preserves_ip_and_user_agent_partitioning(self) -> None:
+        root = self.make_source()
+        path = root / "internal/op/fs.go"
+        suffix = (
+            '\nif mode&driver.LinkCacheIP != 0 { typeKey += "/" + args.IP }\n'
+            'if mode&driver.LinkCacheUA != 0 { typeKey += "/" + args.Header.Get("User-Agent") }\n'
+        )
+        path.write_text(path.read_text(encoding="utf-8") + suffix, encoding="utf-8")
+        PATCHER.apply_patch(root)
+        self.assertTrue(path.read_text(encoding="utf-8").endswith(suffix))
 
     def test_prepare_replacements_combines_edits_to_the_same_file(self) -> None:
         root = Path(self.temp_dir.name)

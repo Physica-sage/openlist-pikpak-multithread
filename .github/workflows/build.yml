@@ -217,6 +217,7 @@ jobs:
         run: |
           python3 scripts/apply_patch.py upstream
           git -C upstream diff --check
+          git -C upstream diff --exit-code -- drivers/strm internal/task_group server/handles/fsmanage.go
           git -C upstream status --short
 
       - name: Set up Go
@@ -235,19 +236,12 @@ jobs:
               drivers/pikpak/driver.go \
               drivers/pikpak/transfer_config.go \
               drivers/pikpak/transfer_config_test.go \
-              drivers/strm/hook.go \
-              drivers/strm/hook_debug.go \
-              drivers/strm/hook_debug_test.go \
               internal/model/args.go \
               internal/op/fs.go \
               internal/op/link_cache_type.go \
               internal/op/link_cache_type_test.go \
-              internal/op/objs_update_hook_batch.go \
-              internal/op/objs_update_hook_batch_debug.go \
-              internal/op/objs_update_hook_batch_test.go \
               internal/fs/copy_move.go \
-              internal/offline_download/tool/transfer.go \
-              server/handles/fsmanage.go
+              internal/offline_download/tool/transfer.go
           )
           if (( ${#unformatted[@]} > 0 )); then
             printf 'Unformatted Go file: %s\n' "${unformatted[@]}" >&2
@@ -258,15 +252,9 @@ jobs:
         working-directory: upstream
         run: |
           go test ./drivers/pikpak
-          go test ./drivers/strm
           go test ./internal/op
           go test ./internal/fs
           go test ./internal/offline_download/tool
-          go test ./server/handles
-
-      - name: Race-test batch hook dispatch
-        working-directory: upstream
-        run: go test -race ./internal/op -run 'TestObjsUpdateHookBatch|TestObjsUpdateHookTargetsOverlap' -count=1
 
   binary:
     name: Build Linux binary (${{ matrix.arch }})
@@ -506,7 +494,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.resolve.outputs.exact_tag }}
-            org.opencontainers.image.title=OpenList PikPak multithread and STRM batch hook fix build
+            org.opencontainers.image.title=OpenList PikPak multithread build
             io.github.openlist.upstream-revision=${{ needs.resolve.outputs.upstream_sha }}
             io.github.openlist.upstream-tag=${{ needs.resolve.outputs.upstream_tag }}
           cache-from: type=gha,scope=openlist-pikpak

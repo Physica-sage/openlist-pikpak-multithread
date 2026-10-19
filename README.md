@@ -1,237 +1,78 @@
-# OpenList PikPak 转存与 STRM 增强版
+# OpenList PikPak 转存加速版
 
-这是一个非官方的 OpenList 构建仓库，当前方向是增强 PikPak 内部转存以及 STRM 批量操作后的本地生成体验。仓库不复制或长期维护 OpenList 源码；GitHub Actions 会获取上游最新稳定 Release，应用一组受检查的补丁，通过测试后发布 `linux/amd64` 和 `linux/arm64` 镜像到当前仓库的 GHCR，并在 GitHub Release 提供同版本的 Linux AMD64/ARM64 二进制压缩包。
+本仓库仅保留 **PikPak 内部转存多线程加速**。不再包含自定义 STRM 修复、批量移动钩子、目录并行扫描或 STRM 诊断日志；这些功能恢复为所构建 OpenList 版本的上游行为。需要继续研究 STRM 时，应使用单独分支或项目，不能混入这个镜像。
 
-当前补丁包含三部分：
+当前适配基线为 **OpenList v4.2.7**，上游提交 `3b28270a4066ea52943a69ecddd850d83f7e8bdc`。自动构建仍每 6 小时检查最新稳定 Release，不追随未发布的 `main` 提交；不兼容的新版本会停止构建，不覆盖已发布镜像。
 
-1. **PikPak 多线程转存**：只加速以 PikPak 为源的内部转存。
-2. **STRM 批量写入钩子完整性修复**：同存储批量移动、复制或合并多个目录时，聚合每个成功项目的精确更新路径，避免只扫描最后一个目录而导致本地 `.strm` 落盘缺失。
-3. **STRM 批量目录有界并行**：对同批操作中路径互不重叠的顶层目录并行执行写入后钩子，减少多个独立媒体目录逐个扫描的等待时间。
+## 保留的加速范围
 
-PikPak 多线程参数只作用于以下路径：
+- 仅对 `PikPak` 驱动作为来源的 OpenList 内部跨存储复制、移动和离线下载后转存配置多 Range 下载。
+- 普通下载、直链访问和媒体播放不会被这组参数启用多线程。
+- 不修改 `PikPak Share`，不修改目标网盘的上传实现。
+- 使用不可从 JSON/Form 输入设置的 `LinkArgs.InternalTransfer` 标记，普通访问与内部转存使用不同链接缓存。
+- 兼容 v4.2.7 的代理/重定向、IP 和 User-Agent 缓存隔离，不移除上游新增的缓存维度。
+- `Alias` 会传递参数；上游 `Crypt` 重建 `LinkArgs`，因此通过 Crypt 包装 PikPak 的来源仍不在这个补丁的加速范围内。
 
-- OpenList 网盘间复制或移动中的下载阶段。
-- 离线下载完成后的目标存储转存阶段。
-- 普通代理下载、直链访问和媒体播放不启用这组参数。
-- 只作用于 `PikPak` 驱动，不作用于 `PikPak Share`。
+## 参数
 
-STRM 增强位于 OpenList 通用文件操作和写入后钩子层，不依赖 PikPak 驱动；关闭全局 `Handle hook after writing` 时不会增加扫描。跨存储异步任务仍由上游的 `TransferCoordinator` 在任务完成后触发钩子。
+| 环境变量 | 默认值 | 范围 | 说明 |
+| --- | ---: | --- | --- |
+| `PIKPAK_TRANSFER_CONCURRENCY` | `10` | `0..64` | 每个内部转存读取器的下载并发；`0` 关闭加速 |
+| `PIKPAK_TRANSFER_PART_SIZE_MB` | `32` | `4..256` | 每片大小，单位 MiB |
 
-批量目录并行只覆盖本补丁接管的**同存储批量移动、复制和合并**，不会改变手动 STRM 扫描，也不依赖 PikPak 或其他特定源驱动。调度前会清洗并去重路径；同一存储中只要出现相同路径、父子路径或根目录重叠，整批会保守地使用上游原始串行递归。互不重叠时采用标准 worker pool：同一钩子中哪个目录先完成，空闲 worker 就立即补上下一个，不存在整批完成屏障。各注册钩子使用互相隔离的任务队列，因此搜索索引或其他慢钩子不会占住 STRM 本地生成的 worker。目录 List 瞬时失败会延迟回队尾重试，而不是静默丢弃整个目录；OpenList 的 `Handle hook rate limit` 大于 `0` 时所有扫描 worker 共用同一个 limiter，保留配置并发的同时不成倍放大 List 请求速率。
+参数首次用于 PikPak 转存时读取，修改后需重新创建容器。无效值回退到默认值。单读取器的 `Concurrency × PartSize` 上限为 2048 MiB，超出时自动缩小分片并记录警告。
 
-这里的 STRM 本地保存不是 OpenList 的网盘“复制”任务：视频和音频通常只在服务器本地生成包含播放 URL 的小型 `.strm` 文本；`ass`、`srt`、`vtt`、`sub` 等下载类型才会读取源文件并保存到本地。
+默认缓冲预算约为 `10 × 32 MiB = 320 MiB`，多个转存任务的内存占用会叠加。全局 `MAX_CONCURRENCY` 和 `MAX_BLOCK_LIMIT` 仍可能限制实际并发及分片大小，它们不是本补丁新增的变量。
 
-## 默认参数
+不再提供 `OPENLIST_BATCH_HOOK_CONCURRENCY`、`OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT`、`OPENLIST_BATCH_HOOK_DEBUG`；旧 Compose 中可删除这些无效变量。上游自身的 STRM 功能和“写入操作后触发目录更新钩子”设置不受本补丁修改。
 
-| 环境变量 | 默认值 | 有效范围 | 说明 |
-| --- | ---: | ---: | --- |
-| `PIKPAK_TRANSFER_CONCURRENCY` | `10` | `0..64` | 每个活跃 RangeReader 的请求并发；`0` 关闭 PikPak 多线程 |
-| `PIKPAK_TRANSFER_PART_SIZE_MB` | `32` | `4..256` | 每个下载分片的大小，单位为 MiB |
-| `OPENLIST_BATCH_HOOK_CONCURRENCY` | `2` | `1..4` | 同批不重叠顶层目录的写入后钩子 worker 数；`1` 关闭目录并行 |
-| `OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT` | `10m` | `>0..1h` | 同存储移动返回后目标目录仍不可见时，后台等待其最终可见的最长时间 |
-| `OPENLIST_BATCH_HOOK_DEBUG` | `false` | `true/false` | 输出批次、扫描队列、每条 hook lane、STRM 单文件阶段及 30 秒 watchdog 诊断日志 |
+## 自动构建和发布
 
-PikPak 两个参数只在第一次 PikPak 转存时读取；批量钩子参数在每次批量调度时读取。空值使用默认值；非法、负数或越界值会回退默认值。修改变量后应重新创建容器。
-
-部分驱动的“移动”接口只负责向云端创建异步任务，接口返回成功时目标目录还不一定可见。批量钩子遇到顶层目标 `object not found` 时会以退避间隔继续检查，最长等待 `OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT`；其他 List 错误仍采用短重试。等待中的顶层目标不占 worker，也不会阻塞已经可见目录的子树处理；重试到期后会重新进入高优先队列。
-
-诊断时设置 `OPENLIST_BATCH_HOOK_DEBUG=true`。日志统一带 `[batch-hook]` 或 `[strm-hook]`：前者记录目标收集、目录 List、每条 hook lane 的入队/开始/完成和队列深度；后者记录 STRM 本地同步以及单个文件的 `link`、`range_read_compare`、`compare_content`、`range_read_write`、`create_local_file`、`copy_local_file` 阶段。批次未结束时每 30 秒输出一次 `scanner_watchdog` 和 `hook_watchdog`，其中 `active_tasks` 会列出仍占用 worker 的路径及持续时间。
-
-OpenList 默认在 `init logrus...` 后把日志写入数据目录的 `log/log.log`，不再继续写 Docker stdout。因此使用默认配置时，不要用 `docker logs` 收集诊断信息；在 Compose 目录中直接跟踪挂载出来的日志文件：
-
-```bash
-tail -n 0 -F ./data/log/log.log 2>&1 | grep --line-buffered -aE '\[batch-hook\]|\[strm-hook\]' | tee openlist-batch-hook-debug.log
-```
-
-若问题已经发生，可先从当前日志文件提取已有记录：
-
-```bash
-grep -aE '\[batch-hook\]|\[strm-hook\]' ./data/log/log.log > openlist-batch-hook-debug.log
-```
-
-只有以 `--log-std`、debug 或 dev 模式启动时，这些日志才会同时出现在 `docker logs`。
-
-日志不记录媒体内容、访问令牌或实际直链，但会包含 OpenList 路径和本地 STRM 保存路径。问题复现并保存日志后可将该变量恢复为 `false`，避免长期产生较多逐文件日志。
-
-两个参数的组合还受每个活跃 RangeReader `2048 MiB` 的名义缓冲上限保护；超过时会保留并发数、自动降低分片大小并记录 warning。例如 `64 × 256 MiB` 会调整为 `64 × 32 MiB`。
-
-这里故意使用 `PIKPAK_TRANSFER_PART_SIZE_MB=32`，而不是无单位的 `PIKPAK_TRANSFER_PART_SIZE=33554432`。OpenList 的 `Link.Concurrency` 和 `Link.PartSize` 都是 `int`，补丁在赋值前会完成范围检查，避免负数或溢出值进入 Downloader。
-
-实际并发不一定等于配置值，大致受以下三者中的最小值限制：
+[build.yml](.github/workflows/build.yml) 获取最新稳定版，解析并核对上游提交，验证补丁后发布 `linux/amd64` 与 `linux/arm64` 镜像和二进制。PikPak 补丁与 overlay 内容参与哈希，纯 PikPak 版与之前混合 STRM 的版本会产生不同精确标签。
 
 ```text
-配置并发数
-ceil(当前读取范围 / 分片大小)
-当前可用的全局 MAX_CONCURRENCY 令牌
+ghcr.io/physica-sage/openlist-pikpak-multithread:latest
+ghcr.io/physica-sage/openlist-pikpak-multithread:v4.2.7
+ghcr.io/physica-sage/openlist-pikpak-multithread:v4.2.7-u<上游提交前12位>-p<补丁哈希>
 ```
 
-OpenList Downloader 的内存量级约为每个活跃 RangeReader 的 `Concurrency * PartSize`。默认值约为 `10 * 32 MiB = 320 MiB`。多个转存任务和目标驱动的并行 RangeReader 可能继续叠加，所以建议先保留 `MAX_CONCURRENCY=64`。
+这些是构建成功后的标签格式，不表示所有标签当前均已发布。生产环境建议使用构建摘要中的精确标签或 digest。手动指定旧稳定版不会更新 `latest`，旧版本不一定与当前补丁兼容。
 
-当内存缓存启用时，实际分片大小还可能被 `MAX_BLOCK_LIMIT` 限制。24 GB 内存机器的自动值通常为 64 MiB，默认的 32 MiB 不会被截断；示例 Compose 显式设置为 64。
-
-## 自动发布
-
-[build.yml](.github/workflows/build.yml) 每 6 小时查询一次 `OpenListTeam/OpenList` 的最新稳定 Release。流水线会：
-
-1. 将 tag 解析到确定的上游 commit。
-2. 对补丁脚本和 overlay 计算内容哈希。
-3. 比较精确 tag、版本 tag 和 `latest` 的 manifest digest；全部一致时跳过，别名缺失或过期时自动重建修复。
-4. 精确检出上游源码并运行带断言的补丁器；任何锚点不匹配都会失败。
-5. 运行补丁器单测、Go 格式检查和受影响包的测试。
-6. 使用 Buildx 构建并发布 AMD64 与 ARM64 镜像。
-7. 并行构建 Linux AMD64 与 ARM64 二进制，生成 SHA-256 校验文件并发布到 GitHub Release。
-
-镜像会获得三类 tag：
-
-```text
-ghcr.io/<owner>/<repo>:latest
-ghcr.io/<owner>/<repo>:v4.2.4
-ghcr.io/<owner>/<repo>:v4.2.4-u84ecda35aae2-p<补丁哈希>
-```
-
-最后一种 tag 同时标识上游提交和补丁内容，适合固定部署版本。上游构建仍会获取当时的前端和基础镜像；需要严格冻结二进制时，应在部署中固定 Actions 构建摘要里的 manifest digest。手动勾选 `force_build` 会重新构建并覆盖同名精确 tag。新上游版本若与补丁冲突，Actions 会失败，已有的 `latest` 不会被新镜像覆盖。
-
-二进制 Release tag 使用 `patched-<精确镜像 tag>`，资产包括：
-
-```text
-openlist-<精确镜像 tag>-linux-amd64.tar.gz
-openlist-<精确镜像 tag>-linux-arm64.tar.gz
-SHA256SUMS
-```
-
-压缩包内的可执行文件名均为 `openlist`，已内嵌对应稳定版前端。二进制采用 `CGO_ENABLED=0` 构建，适合直接解压运行；容器部署仍建议使用 GHCR 多架构镜像。
-
-Actions 页面也可以手动运行工作流并填写某个稳定 tag，例如 `v4.2.3`。手动构建旧版本不会更新 `latest`，除非 tag 输入留空。
-
-## 建立 GitHub 仓库
-
-在 GitHub 创建一个公开的空仓库，例如 `openlist-pikpak-multithread`，然后在本目录执行。公开分发修改镜像时，补丁源码也应保持可访问。
-
-```bash
-git init -b main
-git add .
-git commit -m "feat: build OpenList PikPak multithread images"
-git remote add origin https://github.com/<你的用户名>/openlist-pikpak-multithread.git
-git push -u origin main
-```
-
-首次 push 会触发构建。工作流只使用当前仓库的 `GITHUB_TOKEN`，不需要额外 PAT。仓库必须允许 Actions 写入 Packages；若镜像要免登录拉取，在第一次构建后进入 GitHub Package 设置，将可见性改为 Public，并确认 Package 已关联这个源码仓库。
-
-GitHub 的 schedule 使用 UTC，且可能延迟。公共仓库若连续 60 天没有活动，GitHub 也可能自动停用定时工作流，需要在 Actions 页面重新启用。
+GitHub Release 使用 `patched-<精确镜像标签>`，包含 AMD64/ARM64 压缩包及 SHA-256 校验。工作流使用 GitHub 的仓库令牌发布，无需额外 PAT。
 
 ## 部署
 
-把 [compose.example.yml](compose.example.yml) 中的镜像所有者和仓库名改成实际值，并全部使用小写；工作流生成的 GHCR 路径会强制转成小写。与你当前配置对应的核心部分如下：
-
-```yaml
-services:
-  openlist:
-    image: ghcr.io/<你的用户名>/openlist-pikpak-multithread:latest
-    container_name: openlist
-    user: "0:0"
-    volumes:
-      - ./data:/opt/openlist/data
-      - ./temp/qBittorrent:/opt/openlist/data/temp/qBittorrent
-      - /mnt/alist:/mnt/alist
-      - /mnt/media:/mnt/media
-    ports:
-      - 172.17.0.1:11524:5244
-    environment:
-      - UMASK=022
-      - PIKPAK_TRANSFER_CONCURRENCY=10
-      - PIKPAK_TRANSFER_PART_SIZE_MB=32
-      - OPENLIST_BATCH_HOOK_CONCURRENCY=2
-      - OPENLIST_BATCH_HOOK_NOT_FOUND_TIMEOUT=10m
-      - OPENLIST_BATCH_HOOK_DEBUG=false
-      - MAX_CONCURRENCY=64
-      - MAX_BLOCK_LIMIT=64
-    restart: unless-stopped
-```
-
-示例统一使用你已实际验证可正常启动的 Compose 环境变量列表语法，并保留 `- UMASK=022`。Compose 规范上列表与映射写法通常等价；这里不把先前启动失败归因于 YAML 语法本身，而是采用已验证可用的部署形式。修改这些值后建议使用 `--force-recreate` 重新创建容器，而不只是 restart。
-
-更新容器：
+参考 [compose.example.yml](compose.example.yml)，保留自己的数据卷、端口及运行用户。更新前备份数据和旧镜像 digest；新版本可能迁移数据库，回滚时必要的话同时恢复旧数据。
 
 ```bash
-cd /opt/openlist
 docker compose pull openlist
 docker compose up -d --force-recreate --no-deps openlist
-docker compose ps openlist
 docker exec openlist ./openlist version
-curl -fsS http://172.17.0.1:11524/ping
 ```
 
-`openlist version` 的 `Go Version` 应包含 `linux/arm64`。若 GHCR Package 保持私有，服务器必须先登录；使用具有 `read:packages` 权限的 token：
-
-```bash
-read -rsp 'GitHub package read token: ' CR_PAT
-echo
-printf '%s' "$CR_PAT" | docker login ghcr.io -u '<GitHub 用户名>' --password-stdin
-unset CR_PAT
-```
-
-第一次从 PikPak 发起复制后，日志应出现：
+只执行 `restart` 不会切换镜像。首次 PikPak 内部转存应有类似日志：
 
 ```text
 [pikpak] transfer multirange configured: concurrency=10, part_size=32 MiB
 ```
 
-这表示补丁参数已经进入 PikPak 的内部转存路径。实际连接数仍应结合 `iftop -nP` 和 OpenList debug 日志观察。
+出现持续的 `200/416` Range 异常、限流或校验失败时，先设置 `PIKPAK_TRANSFER_CONCURRENCY=0` 并重新创建容器排除加速因素。升级后先用少量文件核对源端和目标端大小及哈希。
 
-生产环境建议固定精确 tag 或 manifest digest，而不是长期直接跟随 `latest`。升级前先记录当前镜像并一致性备份 OpenList 数据；备份 SQLite 数据时应先停止容器：
-
-```bash
-cd /opt/openlist
-stamp="$(date +%Y%m%d-%H%M%S)"
-image_id="$(docker inspect openlist --format '{{.Image}}')"
-docker inspect openlist --format 'image_ref={{.Config.Image}} image_id={{.Image}}' > "image-$stamp.txt"
-docker image inspect "$image_id" --format 'repo_digests={{json .RepoDigests}}' >> "image-$stamp.txt"
-docker compose stop openlist
-tar -czf "/opt/openlist-backup-$stamp.tgz" data docker-compose.yml
-docker compose start openlist
-```
-
-回滚时，把 Compose 中的 `image` 改为上一次成功构建的精确 tag，或者恢复官方镜像，然后重新创建容器：
-
-```yaml
-image: ghcr.io/<你的用户名>/openlist-pikpak-multithread:v4.2.3-u<上游提交>-p<补丁哈希>
-```
-
-```bash
-docker compose pull openlist
-docker compose up -d --force-recreate --no-deps openlist
-```
-
-OpenList 启动时可能升级持久化数据结构。跨上游版本降级若出现兼容问题，应同时恢复该镜像升级前的配套 `data` 备份，不能只切换镜像。
-
-## 安全边界
-
-旧补丁复用了 `LinkArgs.Type == "transfer"`，但 `Type` 同时可以来自外部下载请求的 `?type=` 查询参数。公开服务的访问者因此可能主动触发多线程请求。
-
-本仓库改用带 `json:"-" form:"-"` 的 `InternalTransfer` 字段，并为普通链接和内部转存使用不同的 link-cache 命名空间。只有 OpenList 的复制和离线转存调用点能设置该标记，外部 `?type=transfer` 不会开启多线程，也不会命中内部转存缓存。
-
-PikPak 偶尔可能对 Range 请求返回 `200` 而不是 `206`。启用新镜像后，建议先对几次大文件转存抽样核对源和目标文件大小及哈希，再长期无人值守运行。出现持续的 `200/416`、`429/503`、速度下降或校验失败时，先设置 `PIKPAK_TRANSFER_CONCURRENCY=0` 并重新创建容器；必要时回滚镜像。本补丁只优化源端读取，目标网盘的上传实现仍可能是端到端瓶颈。
-
-`Alias` 驱动会继续传递 `LinkArgs`；当前上游的 `Crypt` 驱动会重新创建空的 `LinkArgs`，因此用 Crypt 包裹 PikPak 时这个补丁不会生效。
-
-## 本地验证
-
-补丁器测试：
+## 验证补丁
 
 ```bash
 python3 -m unittest discover -s tests -v
-```
-
-对一份干净的 OpenList 源码应用补丁：
-
-```bash
-git clone --depth 1 --branch v4.2.4 https://github.com/OpenListTeam/OpenList.git upstream
+git clone --depth 1 --branch v4.2.7 https://github.com/OpenListTeam/OpenList.git upstream
 python3 scripts/apply_patch.py upstream
 git -C upstream diff --check
+cd upstream
+GOMAXPROCS=1 go test -p 1 ./drivers/pikpak ./internal/op ./internal/fs ./internal/offline_download/tool
 ```
 
-补丁器先验证所有上游锚点和 overlay 目标，再开始写文件，不会在结构不匹配时只应用一半。它也会拒绝对同一源码重复应用。
+补丁器先验证所有锚点与 overlay 目标，再开始写入，拒绝重复应用。测试另行检查不改写 STRM、任务组和批量 HTTP 接口。
 
-## 上游与许可证
+Coder 环境执行编译时需对整个编译进程树限速，不能只使用 `nice`。可用单核亲和性、`GOMAXPROCS=1`、`GOFLAGS=-p=1` 与 `cpulimit --monitor-forks --limit=40 --foreground` 组合限制负载，且不要并行运行其他编译任务。
 
-OpenList 上游项目：[OpenListTeam/OpenList](https://github.com/OpenListTeam/OpenList)。本仓库发布的是修改后的 OpenList 构建，沿用 GNU Affero General Public License v3.0。镜像标签中的上游 commit 和补丁哈希可定位到对应的完整源码与修改。
+## 上游与许可
+
+上游：[OpenListTeam/OpenList](https://github.com/OpenListTeam/OpenList)。修改后构建沿用 GNU Affero General Public License v3.0，精确镜像标签同时记录上游提交和补丁哈希以定位对应源码。
