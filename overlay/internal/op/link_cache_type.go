@@ -3,8 +3,12 @@ package op
 import "github.com/OpenListTeam/OpenList/v4/internal/model"
 
 func linkCacheTypeKey(args model.LinkArgs) string {
-	if args.InternalTransfer {
-		return "transfer/" + args.Type
+	typeKey := "proxy/" + args.Type
+	if args.Redirect {
+		typeKey = "redirect/" + args.Type
 	}
-	return "regular/" + args.Type
+	if args.InternalTransfer {
+		return "transfer/" + typeKey
+	}
+	return typeKey
 }
