@@ -12,10 +12,34 @@ func TestLinkCacheTypeKeySeparatesInternalTransfer(t *testing.T) {
 	if regular == internal {
 		t.Fatalf("regular and internal transfer cache keys collide: %q", regular)
 	}
-	if regular != "regular/" {
-		t.Fatalf("regular key = %q, want %q", regular, "regular/")
+	if regular != "proxy/" {
+		t.Fatalf("regular key = %q, want %q", regular, "proxy/")
 	}
-	if internal != "transfer/" {
-		t.Fatalf("internal key = %q, want %q", internal, "transfer/")
+	if internal != "transfer/proxy/" {
+		t.Fatalf("internal key = %q, want %q", internal, "transfer/proxy/")
+	}
+}
+
+func TestLinkCacheTypeKeyPreservesUpstreamModes(t *testing.T) {
+	tests := []struct {
+		args model.LinkArgs
+		want string
+	}{
+		{model.LinkArgs{Type: "raw"}, "proxy/raw"},
+		{model.LinkArgs{Type: "raw", Redirect: true}, "redirect/raw"},
+		{model.LinkArgs{Type: "raw", InternalTransfer: true}, "transfer/proxy/raw"},
+		{model.LinkArgs{Type: "raw", Redirect: true, InternalTransfer: true}, "transfer/redirect/raw"},
+		{model.LinkArgs{Type: "transfer"}, "proxy/transfer"},
+	}
+	seen := make(map[string]bool)
+	for _, test := range tests {
+		got := linkCacheTypeKey(test.args)
+		if got != test.want {
+			t.Fatalf("key for %+v = %q, want %q", test.args, got, test.want)
+		}
+		if seen[got] {
+			t.Fatalf("cache keys collide: %q", got)
+		}
+		seen[got] = true
 	}
 }
